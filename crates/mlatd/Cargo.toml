@@ -1,9 +1,11 @@
 [package]
 name = "mlatd"
-description = "MLAT server for the mlat-client protocol — Mode S multilateration, world scale in one binary"
+description = "MLAT server speaking the mlat-client protocol; a drop-in replacement for mlat-server"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+# The server is copyleft, like the mlat-server it replaces. The library
+# crates (mb-core, mb-modes, mb-proto) stay MIT OR Apache-2.0.
+license = "AGPL-3.0-or-later"
 repository.workspace = true
 
 [[bin]]
