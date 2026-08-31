@@ -1,0 +1,13 @@
+[package]
+name = "mb-core"
+description = "Shared vocabulary for mlat-bench: geodesy, identifiers, ground truth, seeded RNG streams"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde.workspace = true
+rand.workspace = true
+rand_chacha.workspace = true
+sha2.workspace = true

@@ -1,0 +1,21 @@
+[package]
+name = "mlatd"
+description = "MLAT server for the mlat-client protocol — Mode S multilateration, world scale in one binary"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "mlatd"
+path = "src/main.rs"
+
+[dependencies]
+mb-core.workspace = true
+mb-modes.workspace = true
+mb-proto.workspace = true
+tokio.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
+hex.workspace = true

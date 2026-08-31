@@ -1,0 +1,17 @@
+[package]
+name = "mb-proto"
+description = "mlat-server client wire protocol: handshake, message types, none/zlib/zlib2 framing, SBS parser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+mb-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+flate2.workspace = true
+thiserror.workspace = true
+hex.workspace = true
+
+[dev-dependencies]

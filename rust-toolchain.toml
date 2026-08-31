@@ -1,0 +1,5 @@
+# Pin the toolchain so CI and contributors build what we build.
+# Bump deliberately, in its own commit.
+[toolchain]
+channel = "1.97"
+components = ["rustfmt", "clippy"]

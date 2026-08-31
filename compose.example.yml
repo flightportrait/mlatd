@@ -1,0 +1,24 @@
+# mlatd as a long-running service. Copy, adjust, run:
+#   docker compose -f compose.example.yml up -d --build
+#
+# Bind doctrine: the client port carries feeder traffic and, transitively,
+# receiver coordinates. Expose it on a private interface (VPN/tailnet IP in
+# MLATD_BIND) or behind your ingress — never the raw public interface unless
+# that is a deliberate, rate-limited choice.
+
+services:
+  mlatd:
+    build: .
+    image: mlatd
+    container_name: mlatd
+    restart: unless-stopped
+    command:
+      - --client-listen=0.0.0.0:31090
+      - --basestation-listen=0.0.0.0:31003
+      - --work-dir=/work
+    ports:
+      - "${MLATD_BIND:-127.0.0.1}:31090:31090"   # mlat-client port
+      - "127.0.0.1:31003:31003"                  # SBS out (readsb ingest, local only)
+    volumes:
+      - ${MLATD_WORK_DIR:-./work}:/work
+    mem_limit: 512m

@@ -1,0 +1,15 @@
+[package]
+name = "mb-modes"
+description = "Mode S frame encoder: CRC-24, CPR, DF17/DF11/DF4 builders. Pure functions, no I/O."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+mb-core.workspace = true
+
+[dev-dependencies]
+# Round-trip validation only: encode with mb-modes, decode with an independent
+# implementation. Never a runtime dependency.
+hex.workspace = true
