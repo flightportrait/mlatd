@@ -88,8 +88,6 @@ ADS-B networks run today. The wire protocol, the clock-type table, and
 some estimation heuristics in mlatd follow the behavior of their
 software and its decade of production tuning.
 
-mlatd contains no code from those projects. It is new Rust code.
-
 [mlat-server]: https://github.com/mutability/mlat-server
 
 ## License
