@@ -42,7 +42,7 @@ and selective traffic. Migration is a server-side swap.
 
 ## Verifying the swap on your own traffic
 
-Don't trust the numbers in the README — record your own. The
+The
 [mlat-bench](https://github.com/yoanntlm/mlat-bench) `record` proxy
 taps your live feeder traffic to a capture file; `replay` then feeds
 that identical capture to your current mlat-server and to mlatd, and
