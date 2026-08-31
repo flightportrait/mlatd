@@ -1,12 +1,14 @@
 # mlatd
 
-An MLAT server for Mode S multilateration. It speaks the [mlat-client]
-wire protocol and is a drop-in replacement for [wiedehopf/mlat-server]:
-same handshake, compression modes, selective traffic, result return,
-`sync.json`, and flag names. Rust, one binary.
+mlatd is an MLAT server for Mode S multilateration. It implements the
+wire protocol of [mlat-client]. It is a compatible replacement for
+[wiedehopf/mlat-server]: the handshake, the compression modes, the
+selective traffic, the result messages, the `sync.json` file, and the
+flag names are the same. The server is one Rust binary.
 
-Pre-release: benchmarked against mlat-server on replayed real traffic
-in [mlat-bench]; no long-running production deployment yet.
+Status: pre-release. We benchmark mlatd against mlat-server with
+replayed real traffic in [mlat-bench]. There is no long production
+deployment yet.
 
 [mlat-client]: https://github.com/mutability/mlat-client
 [wiedehopf/mlat-server]: https://github.com/wiedehopf/mlat-server
@@ -14,80 +16,88 @@ in [mlat-bench]; no long-running production deployment yet.
 
 ## Design
 
-Receivers are assigned to geographic shards; each shard is one task
-owning its receivers, clock pairs, and aircraft, so there is no shared
-state and no locking. Clock sync is per-pair online regression with
-exponential decay; state per pair is constant-size. An outlier gate
-rejects bad sync observations, and repeated rejections reset the pair
-after a clock jump. Positions are solved by Gauss-Newton iteration on
-(lat, lon, t), with error estimates from the solution covariance and a
-reference receiver elected per cluster.
+The server puts each receiver in a geographic shard. Each shard is one
+task. A shard owns its receivers, its clock pairs, and its aircraft.
+Shards do not share memory. Clock synchronization is an online
+regression for each receiver pair, with exponential decay; the state
+for each pair has a constant size. A gate rejects bad synchronization
+data. After repeated rejections, the server resets the pair. This
+corrects clock jumps. The solver does Gauss-Newton iteration on
+(lat, lon, t). The error estimate comes from the solution covariance.
+Each cluster of receivers elects its own reference receiver.
 
 ## Run
 
 ```sh
-docker build -t mlatd . && docker run --rm -p 31090:31090 mlatd \
+docker build -t mlatd .
+docker run --rm -p 31090:31090 mlatd \
     --client-listen 0.0.0.0:31090 --basestation-listen 0.0.0.0:31003
 ```
 
-Feeder side, any readsb/ultrafeeder image:
+Add this line to the feeder configuration (readsb or ultrafeeder):
 
 ```
 mlat,<host>,31090,uuid=<station-uuid>
 ```
 
-`compose.example.yml` runs it as a service. The client port carries
-receiver coordinates; bind it to a private interface.
+Use `compose.example.yml` to run mlatd as a service. The client port
+receives receiver coordinates. Bind the port to a private interface.
 
 ## Flags
 
 | flag | default | |
 |---|---|---|
-| `--client-listen` | — | mlat-client port; `[host:]port`, bare port binds 0.0.0.0 |
+| `--client-listen` | — | mlat-client port; `[host:]port`; a bare port binds 0.0.0.0 |
 | `--basestation-listen` | off | SBS/BaseStation output |
-| `--work-dir` | off | writes `sync.json` every 15 s, in mlat-server's format |
+| `--work-dir` | off | writes `sync.json` every 15 s, in the mlat-server format |
 | `--write-csv` | off | results CSV, mlat-server column format |
-| `--self-truth-csv` | off | also multilaterate ADS-B frames and score each fix against the aircraft's own broadcast position |
-| `--shards` | auto (cores−2) | geographic slices within the process |
-| `--shard-cell-deg` / `--shard-cap` | 5.0 / 64 | partition cell size and per-shard receiver capacity |
+| `--self-truth-csv` | off | also multilaterates ADS-B frames and scores each fix against the position the aircraft transmitted |
+| `--shards` | auto (cores−2) | number of geographic shards in the process |
+| `--shard-cell-deg` / `--shard-cap` | 5.0 / 64 | partition cell size and receiver capacity for each shard |
 | `--write-filtered-csv` | off | alpha-beta-smoothed results (experimental) |
-| `--time-scale` / `--group-window-ms` | 1 / 900 | bench-replay support; leave alone in production |
+| `--time-scale` / `--group-window-ms` | 1 / 900 | bench-replay support; do not change in production |
 
 ## Compatibility
 
-Verified against real mlat-client end to end: JSON handshake
-(`compress` none/zlib/zlib2), selective traffic, sync and mlat messages
-for every documented clock type, result return, SBS output,
-`sync.json`, mlat-server flag aliases.
+These functions are tested against the real mlat-client, end to end:
+the JSON handshake with `compress` none, zlib, and zlib2; selective
+traffic; sync and mlat messages for all documented clock types; result
+return; SBS output; `sync.json`; the mlat-server flag aliases.
 
-Not implemented: UDP transport, the filtered-basestation listener,
-`--status-interval`, Kalman result columns.
+These functions are not implemented: UDP transport, the
+filtered-basestation listener, `--status-interval`, Kalman result
+columns.
 
-Migrating from mlat-server: [docs/MIGRATION.md](docs/MIGRATION.md).
+To migrate from mlat-server, read [docs/MIGRATION.md](docs/MIGRATION.md).
 
 ## Development
 
-Developed against [mlat-bench], a replay harness that scores servers
-against known ground truth; benchmark results and methodology live
-there. Until public launch, `crates/` here is published from that
-workspace by its `tools/publish_mlatd.sh`; packaging and docs are
-authored in this repository.
+We develop mlatd against [mlat-bench]. The bench replays captured
+traffic and compares server output with known ground truth. The
+benchmark results and the method are in that repository. Before the
+public launch, the `crates/` directory here is a copy from that
+workspace (its `tools/publish_mlatd.sh`). The packaging and the
+documentation are written in this repository.
+
+## Credit
+
+mlatd exists because of the work of Oliver Jowett (mutability), who
+designed the MLAT protocol and wrote the original [mlat-server] and
+[mlat-client], and of wiedehopf, who maintains the fork that the open
+ADS-B networks run today. The wire protocol, the clock-type table, and
+some estimation heuristics in mlatd follow the behavior of their
+software and its decade of production tuning.
+
+mlatd contains no code from those projects. It is new Rust code.
+
+[mlat-server]: https://github.com/mutability/mlat-server
 
 ## License
 
-Two licenses, by crate:
-
-- `crates/mlatd`, the server, is **AGPL-3.0-or-later**
-  ([LICENSE-AGPL](LICENSE-AGPL)) — the same license as mlat-server.
-  You can run and modify it freely; if you serve a modified mlatd to
-  users over a network, you must offer them your modified source.
+- `crates/mlatd`, the server: **AGPL-3.0-or-later**
+  ([LICENSE-AGPL](LICENSE-AGPL)). This is the license of mlat-server.
+  You can run and change the software freely. If you serve a changed
+  mlatd to users on a network, you must give them the changed source.
 - `crates/mb-core`, `crates/mb-modes`, `crates/mb-proto` — geodesy,
-  Mode S encoding, the wire protocol — are **MIT OR Apache-2.0**
-  ([LICENSE-MIT](LICENSE-MIT), [LICENSE-APACHE](LICENSE-APACHE)).
-
-mlatd contains no code from [mutability/mlat-server] (Oliver Jowett)
-or the [wiedehopf/mlat-server] fork; it is written from scratch in
-Rust. The wire protocol, the clock-type table, and several estimation
-heuristics follow their published behavior.
-
-[mutability/mlat-server]: https://github.com/mutability/mlat-server
+  Mode S encoding, the wire protocol: **MIT**
+  ([LICENSE-MIT](LICENSE-MIT)).

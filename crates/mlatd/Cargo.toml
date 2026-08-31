@@ -1,10 +1,10 @@
 [package]
 name = "mlatd"
-description = "MLAT server speaking the mlat-client protocol; a drop-in replacement for mlat-server"
+description = "MLAT server that implements the mlat-client protocol; a compatible replacement for mlat-server"
 version.workspace = true
 edition.workspace = true
 # The server is copyleft, like the mlat-server it replaces. The library
-# crates (mb-core, mb-modes, mb-proto) stay MIT OR Apache-2.0.
+# crates (mb-core, mb-modes, mb-proto) stay MIT.
 license = "AGPL-3.0-or-later"
 repository.workspace = true
 
