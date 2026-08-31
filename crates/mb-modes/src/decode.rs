@@ -1,6 +1,6 @@
-//! Frame decoding — the inverse of `frames`, for the candidate server and
-//! for tooling. Only the paths the bench emits: DF17 airborne position,
-//! DF11, DF4 with Q-bit altitudes.
+//! Frame decoding, the inverse of `frames`, for the mlatd server and for
+//! tooling. Only the paths the bench emits: DF17 airborne position, DF11,
+//! DF4 with Q-bit altitudes.
 
 use crate::{alt_ac12_decode, alt_ac13_decode, crc24};
 use mb_core::Icao;

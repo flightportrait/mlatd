@@ -52,9 +52,9 @@ pub fn encode_airborne(lat_deg: f64, lon_deg: f64, odd: bool) -> (u32, u32) {
     let yz = (TWO17 * modp(lat_deg, dlat) / dlat + 0.5).floor();
     let yz = (yz as u64 % (1 << 17)) as u32;
 
-    // The latitude the *decoder* will reconstruct — NL must be evaluated
-    // there, not at the true latitude, or we disagree with every decoder
-    // in a zone-boundary sliver.
+    // NL must be evaluated at the latitude the decoder will reconstruct,
+    // not at the true latitude; otherwise encoder and decoder disagree in a
+    // zone-boundary sliver.
     let rlat = dlat * (yz as f64 / TWO17 + (lat_deg / dlat).floor());
 
     let nl_here = nl(rlat);
@@ -70,11 +70,10 @@ pub fn encode_airborne(lat_deg: f64, lon_deg: f64, odd: bool) -> (u32, u32) {
 }
 
 /// Globally decode an even/odd CPR pair. `recent_odd` says which message is
-/// newer (its zone wins). Returns None when the pair straddles an NL boundary
-/// — exactly the case the oracle also rejects.
+/// newer (its zone wins). Returns None when the pair straddles an NL
+/// boundary; mlat-server rejects that case too.
 ///
-/// Used by our own tests and later by mb-metrics; the oracle uses its own
-/// implementation, which is the one that actually judges us.
+/// Used by the mlatd server, the scorer, and tests.
 pub fn global_decode_airborne(
     even: (u32, u32),
     odd: (u32, u32),

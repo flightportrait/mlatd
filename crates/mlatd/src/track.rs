@@ -1,11 +1,10 @@
 //! Track smoothing: an alpha-beta filter per aircraft over accepted fixes.
 //!
-//! The oracle ships Kalman-filtered output beside the raw solves, and smooth
-//! tracks are what downstream consumers (maps, readsb) actually want. An
-//! alpha-beta filter is the minimal honest version: position + velocity
-//! state, gains scheduled by fix quality vs elapsed time. Whether it earns
-//! its place is a bench question — filtered vs raw percentiles on real data
-//! decide, not taste.
+//! mlat-server ships Kalman-filtered output beside the raw solves. An
+//! alpha-beta filter is a minimal equivalent: position and velocity state,
+//! gains scheduled by fix quality against elapsed time. Filtered vs raw
+//! percentiles on the bench decide whether it stays; on real data it
+//! currently loses (p99 901 → 3,757 m), so the flag is experimental.
 
 use mb_core::Geodetic;
 
@@ -42,7 +41,7 @@ impl TrackFilter {
         let plon = self.lon + self.vlon * dt;
         // Gain: alpha in [0.15, 0.85], smaller for worse fixes; beta tied to
         // alpha (standard alpha-beta relation), softened while the track is
-        // young so early velocity estimates don't whip.
+        // young so that early velocity estimates stay damped.
         let quality = (40.0 / err_est_m.max(30.0)).clamp(0.15, 0.8);
         let alpha = if self.n < 5 {
             quality.max(0.5)

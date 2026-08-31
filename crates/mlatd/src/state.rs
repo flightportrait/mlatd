@@ -1,6 +1,6 @@
-//! Shared server state. One mutex over everything — at bench message rates
-//! (a few thousand msgs/s even at 10× replay) contention is not the
-//! bottleneck, and the simplicity is worth more than a lock hierarchy.
+//! Per-shard server state. Each shard owns one State and processes its
+//! messages in one task; there are no locks. Results leave through a
+//! channel to the output task.
 
 use crate::clocksync::PairModel;
 use crate::solve::{self, Observation};
@@ -20,17 +20,17 @@ pub struct ReceiverInfo {
     pub jitter_s: f64,
 }
 
-/// Per-aircraft publication state — the oracle's tail-control heuristics
-/// (mlattrack.py), ported: warm starts, solve backoff, and accuracy-scaled
-/// output rate.
+/// Per-aircraft publication state. Ports of mlat-server's tail-control
+/// heuristics (mlattrack.py): warm starts, solve backoff, and an
+/// accuracy-scaled output rate.
 #[derive(Clone, Copy, Default)]
 struct Track {
     last_pos: Option<Geodetic>,
     last_time_scaled: f64,
     last_attempt_scaled: f64,
-    /// Consecutive speed-gate rejections; too many means the TRACK is wrong
-    /// (locked onto an early bad fix), so the gate resets rather than
-    /// suppressing a correct stream forever.
+    /// Consecutive speed-gate rejections. A long run means the track itself
+    /// is wrong (locked onto an early bad fix); the gate then resets the
+    /// track instead of suppressing a correct stream.
     speed_rejects: u32,
 }
 
@@ -45,23 +45,24 @@ struct Group {
     icao: Icao,
     df17: bool,
     /// (receiver idx, arrival time in that receiver's clock s, output clock
-    /// at insertion). The insertion stamp rides along because one content key
-    /// can hold SEVERAL transmissions — see solve_group.
+    /// at insertion). The insertion stamp is stored because one content key
+    /// can hold several distinct transmissions; see solve_group.
     entries: Vec<(usize, f64, f64)>,
 }
 
-/// Learned per-receiver systematic timing bias — OUR addition, not an oracle
-/// port. Wrong reported coordinates, cable/processing delay, altitude error:
-/// they all present as a stable signed solve residual for that receiver, so
-/// learn it (slow EMA from well-observed solves) and subtract it.
+/// Learned per-receiver systematic timing bias (not an mlat-server port).
+/// Wrong reported coordinates, cable/processing delay, and altitude error
+/// all appear as a stable signed solve residual for that receiver. A slow
+/// EMA over well-observed solves learns the bias; the solver subtracts it.
 #[derive(Clone, Copy, Default)]
 struct RxBias {
     bias_s: f64,
     /// EMA of |residual − bias| — the receiver's non-correctable scatter.
     /// Above QUARANTINE_MAD_S the receiver is excluded from solves (but its
-    /// bias keeps training, so a recovered sensor re-admits itself). The
-    /// adaptive version of the oracle's blacklist: on LocaRDS, sensor os-495
-    /// participated in ghosts at 13% vs ~0.5% for everyone else.
+    /// bias keeps training, so a recovered sensor re-admits itself). An
+    /// adaptive replacement for mlat-server's manual blacklist. Measured on
+    /// LocaRDS: sensor os-495 appeared in ghost fixes at 13 %, the other
+    /// sensors at ~0.5 %.
     mad_s: f64,
     n: u32,
 }
@@ -84,8 +85,8 @@ pub struct State {
     adsb_pos: HashMap<Icao, (Geodetic, f64)>,
     pub mlat_adsb: bool,
     /// Min-tracked offset between the output clock and the reference
-    /// receiver's clock. Results are stamped from the SOLVED reference time
-    /// plus this — arrival-time stamping broke under zlib2's ~1 s batching
+    /// receiver's clock. Results are stamped from the solved reference time
+    /// plus this offset; arrival-time stamping broke under zlib2's ~1 s batching
     /// (bench: flat 148 m error = 0.7 s × ground speed), and real clients
     /// batch exactly like that. Min over many messages converges to true
     /// transport latency; rises slowly to follow reference-clock drift.
@@ -102,8 +103,8 @@ pub struct State {
     /// Emit alpha-beta-smoothed twins of each row (experimental; benched
     /// losing on real data — kept opt-in).
     emit_filtered: bool,
-    // Scaled output clock (matches the oracle's faked-clock behavior at
-    // accelerated replay; see the harness's scoring anchor).
+    // Scaled output clock for accelerated replay (the bench's scoring
+    // anchor expects it). At time_scale 1 this is real time.
     t0_real: Instant,
     t0_unix: f64,
     time_scale: f64,
@@ -134,9 +135,9 @@ impl State {
             alts_ft: HashMap::new(),
             tracks: HashMap::new(),
             filters: HashMap::new(),
-            // ONE scaled-clock epoch for the whole process (main creates it):
-            // per-shard epochs diverge by (k−1)·startup-gap at speed k — the
-            // sharded ladder measured that as a flat 3 km error at 4×.
+            // One scaled-clock epoch for the whole process (created in main).
+            // Per-shard epochs diverge by (k−1)·startup-gap at speed k;
+            // measured as a flat 3 km error at 4×.
             t0_unix: epoch.0,
             t0_real: epoch.1,
             time_scale,
@@ -263,10 +264,11 @@ impl State {
                 created: Instant::now(),
                 reporters: Vec::new(),
             });
-        // Train every pair this receiver now shares the event with — capped
-        // at 15 reporters per syncpoint, the oracle's MAX_SYNC_AC. At 60
-        // receivers the uncapped k² training was the metro-scale CPU wall;
-        // 15 receivers' worth of pairings per event is already sync overkill.
+        // Train every pair this receiver now shares the event with, capped
+        // at 15 reporters per syncpoint (mlat-server's MAX_SYNC_AC). Uncapped,
+        // pair training grows as k² and dominated CPU at 60 co-hearing
+        // receivers; 15 reporters give the models more observations than
+        // they need.
         if sp.reporters.len() >= 15 {
             return;
         }
@@ -343,26 +345,26 @@ impl State {
         }
     }
 
-    /// Publication gates, from the oracle's accumulated behavior:
-    /// solve backoff per aircraft, covariance error ceiling, and the
-    /// accuracy-scaled rate rule `elapsed/20 < err/max_err → skip`.
-    const RESOLVE_BACKOFF_S: f64 = 0.4; // oracle: 0.7; we keep more rate
+    /// Publication gates, ported from mlat-server: solve backoff per
+    /// aircraft, a covariance error ceiling, and the accuracy-scaled rate
+    /// rule `elapsed/20 < err/max_err → skip`.
+    const RESOLVE_BACKOFF_S: f64 = 0.4; // mlat-server uses 0.7; 0.4 keeps more update rate
     const MAX_ERR_M: f64 = 10_000.0;
-    /// Throttle scale. The oracle throttles with err/10 km — but its error
-    /// estimates run ~9× real (bench, lab scenario), so its EFFECTIVE
-    /// strictness is ~err_true/1.1 km. Our estimates are calibrated, so we
-    /// throttle against a matching honest scale rather than copying the
-    /// constant.
+    /// Throttle scale. mlat-server throttles with err/10 km, but its error
+    /// estimates run ~9× above the true error (measured on the lab
+    /// scenario), so its effective strictness is ~err_true/1.1 km. The
+    /// estimates here are calibrated; this scale matches the effective
+    /// strictness, not the written constant.
     const THROTTLE_SCALE_M: f64 = 1_500.0;
 
     fn solve_group(&mut self, g: &Group) {
-        // CONTINENTAL-SCALE FIX (LocaRDS, 316 receivers across Europe): a
-        // single global sync reference only serves receivers that co-hear
-        // aircraft with it — everyone else converted to nothing and 2.17M
-        // sync observations produced zero solves. But a message group IS a
-        // locality: its receivers heard the same transmission, so they are
-        // neighbors. Pick the reference PER GROUP — the member with the most
-        // usable direct pair models to the other members.
+        // The reference receiver is elected per group, not globally. A
+        // single global reference only serves receivers that co-hear
+        // aircraft with it; on continental geometry (LocaRDS, 316 receivers)
+        // 2.17 M sync observations produced zero solves. The receivers of
+        // one group heard the same transmission, so they are neighbors; the
+        // member with the most usable direct pair models to the other
+        // members becomes the reference.
         const CLUSTER_SPAN_S: f64 = 2.5e-3;
 
         let mut members: Vec<usize> = Vec::new();
@@ -398,8 +400,8 @@ impl State {
                 Some(direct)
             } else {
                 // Two-hop: route through a cluster member that pairs with
-                // both ends. Sigmas add in quadrature; the honest cost of the
-                // detour keeps downstream weighting truthful.
+                // both ends. The sigmas add in quadrature, so the detour's
+                // extra uncertainty flows into the solve weights.
                 let mut best: Option<(f64, f64)> = None;
                 for &h in &members {
                     if h == rx || h == local_ref {
@@ -468,11 +470,11 @@ impl State {
             obs.push(Observation {
                 rx: self.receivers[rx].ecef,
                 t_s: t + b.bias_s,
-                // NOTE: folding the learned residual variance into this
-                // weight was tried and benched WORSE on the hostile world
-                // (109/336/910 vs 105/293/852 m) — the pair-model sigma
-                // already carries the receiver's scatter; double-counting it
-                // over-flattens the weights. Scalar bias only.
+                // Folding the learned residual variance into this weight
+                // measured worse on the hostile scenario (109/336/910 vs
+                // 105/293/852 m): the pair-model sigma already carries the
+                // receiver's scatter, and counting it twice flattens the
+                // weights. Scalar bias only.
                 err_s: sigma,
             });
             users.push(self.receivers[rx].user.clone());
@@ -483,7 +485,8 @@ impl State {
             return;
         }
         // Content-time stamping: solved reference time + min-tracked offset,
-        // tracked PER reference receiver (each local ref = its own domain).
+        // tracked per reference receiver (each local reference is its own
+        // clock domain).
         let t_ref_min = obs.iter().map(|o| o.t_s).fold(f64::INFINITY, f64::min);
         let delta = stamp - t_ref_min;
         let off = match self.stamp_offset.get(&local_ref) {
@@ -504,9 +507,9 @@ impl State {
                 cluster.first().map(|c| c.3).unwrap_or(0.0)
             );
         }
-        // Cap the solve size (oracle: MAX_GROUP=15): beyond ~16 receivers the
-        // extra observations buy almost no geometry but cost quadratic solve
-        // time. Keep the most precise ones.
+        // Cap the solve size (mlat-server MAX_GROUP = 15): beyond ~16
+        // receivers the extra observations add little geometry and quadratic
+        // solve time. Keep the most precise ones.
         if obs.len() > 16 {
             let mut idx: Vec<usize> = (0..obs.len()).collect();
             idx.sort_by(|&a, &b| obs[a].err_s.total_cmp(&obs[b].err_s));
@@ -521,11 +524,11 @@ impl State {
         if now_scaled - track.last_attempt_scaled < Self::RESOLVE_BACKOFF_S {
             return;
         }
-        // The oracle's dof discipline (mlattrack: `elapsed > 30 and dof == 0:
-        // continue`): a 4-receiver fixed-altitude solve has zero redundancy —
-        // no residual can catch a bad observation — so allow it only when the
-        // track is starved. Real-data bench: these zero-dof solves were the
-        // ghost/tail factory (74 gross, p99 1.2 km).
+        // mlat-server's dof rule (mlattrack: `elapsed > 30 and dof == 0:
+        // continue`): a 4-receiver fixed-altitude solve has zero redundancy,
+        // so no residual can catch a bad observation. Allow it only when the
+        // track is starved. Measured on real data: zero-dof solves produced
+        // most of the ghosts and tail error (74 gross, p99 1.2 km).
         if obs.len() == 4 && now_scaled - track.last_time_scaled < 30.0 {
             self.stats_rejected += 1;
             return;
@@ -538,8 +541,8 @@ impl State {
             .get_mut(&icao)
             .expect("entry above")
             .last_attempt_scaled = now_scaled;
-        // Warm start from the last accepted fix when fresh (< 60 s), the
-        // oracle's convergence aid; else the receivers' centroid.
+        // Warm start from the last accepted fix when fresh (< 60 s), as in
+        // mlat-server; else start from the receivers' centroid.
         let init = match track.last_pos {
             Some(p) if now_scaled - track.last_time_scaled < 60.0 => Geodetic { alt_m, ..p },
             _ => {
@@ -577,10 +580,11 @@ impl State {
                     self.stats_rejected += 1;
                     return;
                 }
-                // Physics continuity: a fix implying > 400 m/s vs a recent
-                // accepted fix is a ghost (the diffuse real-data tail). Five
-                // consecutive rejections reset the TRACK — the gate must
-                // never suppress a correct stream behind one bad early fix.
+                // Speed continuity: a fix that implies > 400 m/s against a
+                // recent accepted fix is a ghost (the diffuse real-data
+                // tail). Five consecutive rejections reset the track, so the
+                // gate cannot suppress a correct stream behind one bad early
+                // fix.
                 if let Some(last) = track.last_pos {
                     if elapsed < 30.0
                         && elapsed > 0.05
@@ -596,10 +600,10 @@ impl State {
                         return;
                     }
                 }
-                // DF17 (self-truth) fixes: score against the aircraft's own
-                // broadcast position, keep them OUT of results.csv/SBS so the
-                // bench comparison stays apples-to-apples, but DO learn
-                // receiver biases from them — ADS-B traffic is abundant.
+                // DF17 (self-truth) fixes are scored against the aircraft's
+                // own broadcast position and stay out of results.csv/SBS, so
+                // the bench comparison stays like-for-like. Receiver biases
+                // still learn from them: ADS-B traffic is abundant.
                 if is_df17_group {
                     if sol.err_est_m > Self::MAX_ERR_M {
                         return; // same ceiling as published fixes
@@ -633,8 +637,8 @@ impl State {
                 }
                 self.stats_solved += 1;
                 // Learn per-receiver bias only from well-observed, full-set
-                // solves (residual order matches rx_ids) with a slow EMA —
-                // it must absorb the receiver's systematic error, not the
+                // solves (residual order matches rx_ids) with a slow EMA: it
+                // must absorb the receiver's systematic error, not the
                 // geometry of any single fix.
                 if sol.residuals_s.len() == rx_ids.len()
                     && rx_ids.len() >= 5
@@ -694,7 +698,7 @@ impl State {
                 };
                 // Fan out via the output task: CSV, SBS (readsb ingest) and
                 // result messages (mlat-client "old" format, field-for-field
-                // the oracle's report_mlat_position_old).
+                // mlat-server's report_mlat_position_old).
                 let (d, tm) = sbs_datetime(stamp);
                 let sbs_line = format!(
                     "MSG,3,1,1,{},1,{d},{tm},{d},{tm},,{alt_ft},,,{:.5},{:.5},,,,,,0\r\n",
@@ -728,8 +732,8 @@ impl State {
 }
 
 impl State {
-    /// Oracle-shaped sync.json so existing monitoring (sync-map & friends)
-    /// works unchanged: {user: {peers: {peer: [count, .., ppm, ..]}}}.
+    /// sync.json in mlat-server's shape, so existing monitoring tools work
+    /// unchanged: {user: {peers: {peer: [count, .., ppm, ..]}}}.
     pub fn sync_json(&self) -> serde_json::Value {
         let mut top = serde_json::Map::new();
         for (i, r) in self.receivers.iter().enumerate() {
@@ -752,7 +756,7 @@ impl State {
     }
 }
 
-/// SBS wants local-ish date/time strings; emit UTC from the unix stamp.
+/// SBS rows carry date/time strings; emit UTC derived from the unix stamp.
 fn sbs_datetime(unix: f64) -> (String, String) {
     let secs = unix as i64;
     let days = secs / 86400;

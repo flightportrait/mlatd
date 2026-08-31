@@ -57,8 +57,8 @@ impl SimNanos {
 }
 
 /// Geodetic position on the WGS84 ellipsoid. Altitude is meters above the
-/// ellipsoid (we ignore the geoid separation on purpose — the oracle does too,
-/// and MLAT errors dwarf it).
+/// ellipsoid. The geoid separation is ignored; mlat-server ignores it too,
+/// and MLAT errors are much larger.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Geodetic {
     pub lat_deg: f64,
@@ -114,8 +114,8 @@ impl Geodetic {
 }
 
 impl Ecef {
-    /// ECEF → geodetic via Bowring's method (one iteration is sub-millimeter
-    /// for aircraft altitudes, which is far below anything we measure).
+    /// ECEF → geodetic via Bowring's method. One iteration is
+    /// sub-millimeter for aircraft altitudes, far below MLAT error scales.
     pub fn to_geodetic(&self) -> Geodetic {
         let b = WGS84_A * (1.0 - WGS84_F);
         let ep2 = (WGS84_A * WGS84_A - b * b) / (b * b);

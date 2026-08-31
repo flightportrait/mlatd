@@ -1,22 +1,21 @@
-//! Internal sharding: the planet on one binary, no partitioning ops.
+//! Geographic sharding inside one process.
 //!
-//! The single-mutex design capped at ~800 dense receivers on one core
-//! (bench: real-time fine at 124% CPU, 2× load collapsed at a pinned 143%).
-//! Physics makes sharding natural: sync pairs and solve clusters only form
-//! between CO-HEARING receivers — geographic neighbors. So:
+//! The earlier single-mutex design capped at ~800 dense receivers on one
+//! core (bench: real time ran at 124 % CPU; 2× load collapsed at a pinned
+//! 143 %). Sync pairs and solve clusters only form between receivers that
+//! hear the same aircraft, and those are geographic neighbors, so:
 //!
-//! - Each shard OWNS a full `State` inside its own task. No locks anywhere;
-//!   connections send parsed messages over an mpsc.
-//! - A receiver is assigned at handshake by its 5° geo-cell; cells stick to
-//!   the least-loaded shard at first sight, so neighborhoods stay together
-//!   and load spreads by actual receiver density (longitude bands would put
-//!   all of Europe on one shard).
-//! - Cross-shard receiver pairs simply never form — the same tradeoff as the
-//!   oracle's --partition, but geography-aligned so the boundary is thin.
-//!   A boundary aircraft heard by two shards may be solved by both; the
-//!   output task dedupes by (icao, time bucket).
-//! - One output task owns the CSV writers and fan-out channel; shards send
-//!   it finished rows. Writers never contend with solving.
+//! - Each shard owns a full `State` inside its own task. There are no
+//!   locks; connections send parsed messages over an mpsc channel.
+//! - A receiver is assigned at handshake by its geographic cell. New cells
+//!   join the shard that owns most of their neighbor cells, up to a
+//!   capacity cap (see shard_for); regions stay contiguous.
+//! - Cross-shard receiver pairs never form. This is the same tradeoff as
+//!   mlat-server's --partition, but the boundary follows geography, so it
+//!   is thin. A boundary aircraft heard by two shards may be solved by
+//!   both; the output task dedupes by (icao, time bucket).
+//! - One output task owns the CSV writers and the fan-out channel; shards
+//!   send it finished rows. Writers never contend with solving.
 
 use crate::state::{Published, ReceiverInfo, State};
 use mb_core::Icao;
@@ -32,9 +31,9 @@ pub enum ShardMsg {
         ot: f64,
         em: String,
         om: String,
-        /// Output-clock time at CONNECTION READ — before shard queueing.
-        /// Stamping at shard-processing time lagged by the queue depth under
-        /// load (bench: flat 2.2 km at 4×, heartbeats bypass queues).
+        /// Output-clock time at connection read, before shard queueing.
+        /// Stamping at shard-processing time lags by the queue depth under
+        /// load (bench: flat 2.2 km error at 4×).
         at_scaled: f64,
     },
     Mlat {
@@ -72,15 +71,13 @@ pub struct ShardHandle {
 
 pub struct Router {
     shards: Vec<Arc<ShardHandle>>,
-    /// Geographic cell size (degrees) and per-shard receiver capacity —
-    /// deployment tunables with a measured tradeoff (see shard bench notes):
-    /// 5°/64 suits sparse-continental real networks (LocaRDS: full
-    /// recovery); dense synthetic metros under extreme load prefer 2° or
-    /// plain least-loaded. No constant serves every geometry.
+    /// Geographic cell size (degrees) and per-shard receiver capacity.
+    /// Deployment tunables with a measured tradeoff: 5°/64 suits sparse
+    /// continental networks (LocaRDS recovers fully); dense metros under
+    /// extreme load prefer 2°. No constant serves every geometry.
     cell_deg: f64,
     cap: usize,
-    /// 2°×2° cell → shard index, sticky from first sight (5° quantized dense
-    /// metros into ~9 blocks and starved the partition of granularity).
+    /// Geographic cell → shard index, sticky from first assignment.
     cells: std::sync::Mutex<HashMap<(i16, i16), usize>>,
 }
 
@@ -94,13 +91,12 @@ impl Router {
         }
     }
 
-    /// Shard for a receiver at (lat, lon): its cell's shard, remembered
-    /// forever. A NEW cell joins the shard owning most of its 8 neighbors —
-    /// geography first, load second. Pure least-loaded assignment scattered
-    /// adjacent European cells across 20 shards and sliced real co-hearing
-    /// neighborhoods apart (LocaRDS: results −32%, coverage 27→18%);
-    /// neighbor affinity keeps regions contiguous, so parallelism spreads
-    /// only where the map actually spreads.
+    /// Shard for a receiver at (lat, lon): its cell's shard, remembered for
+    /// the process lifetime. A new cell joins the shard that owns most of
+    /// its 8 neighbor cells; load only breaks ties. Pure least-loaded
+    /// assignment scattered adjacent European cells across 20 shards and
+    /// cut real co-hearing neighborhoods apart (LocaRDS: results −32 %,
+    /// coverage 27 → 18 %). Neighbor affinity keeps regions contiguous.
     pub fn shard_for(&self, lat: f64, lon: f64) -> (usize, Arc<ShardHandle>) {
         let cell = (
             (lat / self.cell_deg).floor() as i16,
@@ -111,10 +107,11 @@ impl Router {
             Some(&i) => i,
             None => {
                 // Region growing with a capacity cap: prefer the neighbor
-                // shard, but once a shard holds ~CAP receivers the frontier
-                // starts a new one (itself contiguous). Pure affinity fused
-                // dense w800 into one shard (coverage 66→45% at 4×); pure
-                // least-loaded shredded real Europe (LocaRDS −32%).
+                // shard, but once a shard holds cap receivers the frontier
+                // starts a new contiguous region. Uncapped affinity fused a
+                // dense 800-receiver world into one shard (coverage
+                // 66 → 45 % at 4×); pure least-loaded cut real Europe apart
+                // (LocaRDS −32 %).
                 let cap = self.cap;
                 let mut votes: HashMap<usize, usize> = HashMap::new();
                 for dy in -1i16..=1 {

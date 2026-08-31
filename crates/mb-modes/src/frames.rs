@@ -84,7 +84,7 @@ pub fn df4(icao: Icao, fs: u8, alt_ft: i32) -> Option<[u8; 7]> {
 mod tests {
     use super::*;
 
-    /// THE test: byte-for-byte reproduction of a real captured DF17 frame
+    /// Golden test: byte-for-byte reproduction of a real captured DF17 frame
     /// (the canonical pair from the 1090 MHz literature, icao 40621D,
     /// 38000 ft). If this passes, encoder, CPR, altitude, and CRC all agree
     /// with the real world at once.

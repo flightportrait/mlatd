@@ -1,11 +1,10 @@
-//! mlatd — a candidate MLAT server, benched by mlat-bench.
+//! mlatd — an MLAT server for the mlat-client protocol.
 //!
-//! v0 scope, on purpose: mlat-client protocol over `compress: none`,
-//! pairwise clock sync (windowed linear fit, star topology to one reference
-//! receiver, GPS-preferred), content-keyed message grouping, fixed-altitude
-//! Gauss-Newton TDOA. Everything it doesn't do (zlib framing, sync graph
-//! traversal, Kalman track filtering, result return to clients) is a
-//! deliberate gap the bench will price.
+//! Connection handling and wiring live in this file: the handshake
+//! (compress none/zlib/zlib2), selective traffic, per-connection routing to
+//! a geographic shard, the output task (CSV, SBS, result return), sync.json
+//! export, and stats. Estimation lives in state.rs, clocksync.rs, and
+//! solve.rs; sharding in shard.rs.
 //!
 //! Bench it:
 //!   cargo run -p mlatd -- --write-csv /tmp/cand.csv --time-scale 10 --group-window-ms 90
@@ -34,12 +33,13 @@ use tokio::time::Duration;
 struct Cli {
     #[arg(long, default_value = "127.0.0.1:40160")]
     listen: String,
-    /// Oracle-format results CSV output (the bench's scoring input).
+    /// Results CSV output in mlat-server's column format (the bench's
+    /// scoring input).
     /// Optional in production: results also flow to connected clients
     /// (return_results) and the SBS listener.
     #[arg(long)]
     write_csv: Option<std::path::PathBuf>,
-    /// Message-grouping window, milliseconds of REAL time. At an accelerated
+    /// Message-grouping window, milliseconds of real time. At an accelerated
     /// replay divide the usual 900 by the speed factor.
     #[arg(long, default_value_t = 900)]
     group_window_ms: u64,
@@ -47,15 +47,15 @@ struct Cli {
     /// bench's --speed so scoring maps time correctly.
     #[arg(long, default_value_t = 1.0)]
     time_scale: f64,
-    /// Oracle-compatible alias for --listen ([host:]port accepted).
+    /// mlat-server-compatible alias for --listen ([host:]port accepted).
     #[arg(long)]
     client_listen: Option<String>,
     /// SBS/BaseStation output listener (what readsb ingests), e.g.
-    /// 127.0.0.1:40161. Oracle flag name kept for drop-in swaps.
+    /// 127.0.0.1:40161. mlat-server's flag name, kept for compatibility.
     #[arg(long)]
     basestation_listen: Option<String>,
-    /// Work dir: sync.json is written here every 15 s in the oracle's shape
-    /// so existing monitoring keeps working.
+    /// Work dir: sync.json is written here every 15 s in mlat-server's
+    /// format, so existing monitoring keeps working.
     #[arg(long)]
     work_dir: Option<std::path::PathBuf>,
     /// Shard count (0 = auto: available cores − 2, min 1). Each shard owns
@@ -69,14 +69,14 @@ struct Cli {
     /// Receiver capacity per shard before region growth spills over.
     #[arg(long, default_value_t = 64)]
     shard_cap: usize,
-    /// Alpha-beta-smoothed results, same CSV format — the drop-in analogue
-    /// of the oracle's Kalman output. Score raw vs filtered to see if it
-    /// earns its place.
+    /// Alpha-beta-smoothed results, same CSV format: the analogue of
+    /// mlat-server's Kalman output. Experimental; on real data it measured
+    /// worse than raw output.
     #[arg(long)]
     write_filtered_csv: Option<std::path::PathBuf>,
     /// Multilaterate DF17 (ADS-B) frames too and score each fix against the
-    /// aircraft's own broadcast position — real-world accuracy without
-    /// external truth. Rows: t,icao,err_m,est_m,n → this CSV.
+    /// aircraft's own broadcast position: live accuracy without external
+    /// truth. Rows: t,icao,err_m,est_m,n → this CSV.
     #[arg(long)]
     self_truth_csv: Option<std::path::PathBuf>,
 }
@@ -96,7 +96,7 @@ async fn main() -> Result<()> {
         .client_listen
         .as_deref()
         .map(|s| {
-            // Accept the oracle's bare-port form.
+            // Accept mlat-server's bare-port form.
             if s.contains(':') {
                 s.to_string()
             } else {
@@ -105,7 +105,7 @@ async fn main() -> Result<()> {
         })
         .unwrap_or_else(|| cli.listen.clone());
 
-    // ONE scaled-clock epoch for everything: shards, heartbeats, stamps.
+    // One scaled-clock epoch for everything: shards, heartbeats, stamps.
     let epoch_real = std::time::Instant::now();
     let epoch_unix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -238,7 +238,7 @@ async fn main() -> Result<()> {
             }
         });
     }
-    // sync.json export for existing monitoring — merged across shards.
+    // sync.json export for existing monitoring, merged across shards.
     if let Some(dir) = cli.work_dir.clone() {
         let router = router.clone();
         let _ = std::fs::create_dir_all(&dir);
@@ -315,9 +315,9 @@ async fn handle_client(
         anyhow::bail!("closed before handshake");
     }
     let hs: serde_json::Value = serde_json::from_slice(&hs_line).context("handshake not JSON")?;
-    // Compression preference: none (cheapest for us), else zlib2, else zlib —
-    // real feeders overwhelmingly offer zlib2 and denying them would be
-    // instant disqualification in the field.
+    // Compression preference: none (cheapest to decode), else zlib2, else
+    // zlib. Real feeders overwhelmingly offer zlib2; denying it would
+    // reject most of the field.
     let offered: Vec<String> = hs["compress"]
         .as_array()
         .map(|a| {
@@ -354,7 +354,8 @@ async fn handle_client(
         alt_m: alt,
     };
     let gps = clock_type.starts_with("radarcape_gps");
-    // Route by geography: this receiver's shard owns it for life.
+    // Route by geography: this receiver's shard owns it for the process
+    // lifetime.
     let (_shard_idx, shard) = router.shard_for(lat, lon);
     shard
         .receivers
@@ -378,11 +379,10 @@ async fn handle_client(
         .map_err(|_| anyhow::anyhow!("shard gone"))?;
     let rx = orx.await.map_err(|_| anyhow::anyhow!("shard gone"))?;
     let wants_results = hs["return_results"].as_bool().unwrap_or(false);
-    // Real mlat-client withholds ALL traffic until asked: selective traffic
-    // is not optional politeness, it is the request channel (dress-rehearsal
-    // finding: 5 real clients connected, decoded beast, sent nothing —
-    // "0 of 8 ADS-B used"). Mimic the oracle: enable it, ask for rate
-    // reports, and start_sending every aircraft the client reports.
+    // A real mlat-client sends no traffic until asked: selective traffic is
+    // the request channel (observed with 5 real clients: connected, decoded
+    // Beast, sent nothing). Do what mlat-server does: enable it, request
+    // rate reports, and start_sending every aircraft the client reports.
     let reply = format!(
         "{{\"compress\":\"{negotiated}\",\"reconnect_in\":300,\"selective_traffic\":true,\
          \"heartbeat\":true,\"return_results\":{wants_results},\"rate_reports\":true,\
@@ -479,7 +479,7 @@ async fn handle_client(
 }
 
 /// seen/rate_report trigger start_sending for aircraft not yet requested on
-/// this connection — a real mlat-client withholds everything until asked.
+/// this connection; a real mlat-client sends nothing until asked.
 async fn process_line_tx(
     shard: &Arc<ShardHandle>,
     rx: usize,

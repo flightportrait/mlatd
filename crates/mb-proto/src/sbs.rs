@@ -1,7 +1,7 @@
-//! Minimal SBS/BaseStation "MSG" line parser — just enough to score the
-//! oracle's --basestation-listen output. Full field semantics land in M4.
+//! Minimal SBS/BaseStation "MSG" line parser: enough to score a server's
+//! --basestation-listen output.
 
-/// One parsed MSG,3-ish line. Fields we don't score stay unparsed.
+/// One parsed MSG,3 line. Unscored fields stay unparsed.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SbsPosition {
     pub icao_hex: String,

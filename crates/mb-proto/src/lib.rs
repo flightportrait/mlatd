@@ -84,7 +84,7 @@ pub enum Compress {
 /// that simply lacks the key.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Handshake {
-    pub version: u8, // 2 or 3; we speak 3
+    pub version: u8, // 2 or 3; this implementation sends 3
     pub user: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub uuid: Option<String>,
@@ -110,9 +110,9 @@ impl Handshake {
     }
 }
 
-/// Timestamp as sent on the wire. Units depend on clock_type and are settled
-/// empirically in docs/protocol-notes.md; we carry the raw JSON number
-/// faithfully (serde_json::Number preserves int-vs-float distinction, which
+/// Timestamp as sent on the wire. Units depend on clock_type and are
+/// settled empirically in docs/protocol-notes.md. The raw JSON number is
+/// carried unchanged (serde_json::Number preserves int-vs-float, which
 /// matters: CPython emits `12000000` for an int where a float would be
 /// `12000000.0`, and byte-exact capture replay must not launder one into the
 /// other).
@@ -242,7 +242,7 @@ impl ServerMsg {
         Ok(ServerMsg::Unknown(v))
     }
 
-    /// The first line the server sends after our handshake.
+    /// The first line the server sends after the client handshake.
     pub fn parse_handshake_reply(line: &[u8]) -> Result<ServerMsg, ProtoError> {
         let v: serde_json::Value = serde_json::from_slice(line)?;
         if v.get("deny").is_some() {
