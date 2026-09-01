@@ -130,6 +130,11 @@ impl Router {
         }
     }
 
+    /// Public cell size accessor for the partition export.
+    pub fn cell_size_of(&self, level: u8) -> f64 {
+        self.cell_size(level)
+    }
+
     fn cell_size(&self, level: u8) -> f64 {
         self.base_deg / f64::from(1u32 << level)
     }
@@ -253,6 +258,15 @@ impl Router {
         if *count > SPLIT_AT && self.splittable(key.0) {
             map.split.insert(key);
         }
+        // Count the receiver here, at claim time, not after the shard's
+        // AddReceiver round-trip: during a connect burst the async count
+        // lags the claims, the capacity gate reads stale zeros, and one
+        // shard swallows the world (seen on the partition map: 3 shards
+        // holding 800 receivers). The connection's teardown decrement in
+        // main pairs with this increment.
+        self.shards[idx]
+            .receivers
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         (idx, self.shards[idx].clone())
     }
 

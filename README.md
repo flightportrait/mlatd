@@ -52,7 +52,7 @@ receives receiver coordinates. Bind the port to a private interface.
 |---|---|---|
 | `--client-listen` | — | mlat-client port; `[host:]port`; a bare port binds 0.0.0.0 |
 | `--basestation-listen` | off | SBS/BaseStation output |
-| `--work-dir` | off | writes `sync.json` every 15 s, in the mlat-server format |
+| `--work-dir` | off | writes `sync.json` (mlat-server format) and `partition.json` (the shard map as data) every 15 s |
 | `--write-csv` | off | results CSV, mlat-server column format |
 | `--self-truth-csv` | off | also multilaterates ADS-B frames and scores each fix against the position the aircraft transmitted |
 | `--shards` | auto (cores−2) | number of geographic shards in the process |

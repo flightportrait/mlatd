@@ -288,6 +288,28 @@ async fn main() -> Result<()> {
                     dir.join("sync.json"),
                     serde_json::to_vec(&serde_json::Value::Object(merged)).unwrap_or_default(),
                 );
+                // partition.json beside it: the cell map as data, for
+                // plots/partition.py. Cells carry no receiver positions.
+                let cells: Vec<serde_json::Value> = router
+                    .partition_dump()
+                    .into_iter()
+                    .map(|(level, y, x, shard, rx)| {
+                        let size = router.cell_size_of(level);
+                        serde_json::json!({
+                            "level": level,
+                            "lat0": f64::from(y) * size,
+                            "lat1": (f64::from(y) + 1.0) * size,
+                            "lon0": f64::from(x) * size,
+                            "lon1": (f64::from(x) + 1.0) * size,
+                            "shard": shard,
+                            "rx": rx,
+                        })
+                    })
+                    .collect();
+                let _ = std::fs::write(
+                    dir.join("partition.json"),
+                    serde_json::to_vec(&serde_json::Value::Array(cells)).unwrap_or_default(),
+                );
             }
         });
     }
@@ -392,10 +414,8 @@ async fn handle_client(
     let gps = clock_type.starts_with("radarcape_gps");
     // Route by geography: this receiver's shard owns it for the process
     // lifetime.
+    // The router counts the receiver at claim time; teardown decrements.
     let (_shard_idx, shard) = router.shard_for(lat, lon);
-    shard
-        .receivers
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let (otx, orx) = oneshot::channel();
     shard
         .tx
