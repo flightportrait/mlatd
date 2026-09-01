@@ -44,6 +44,9 @@ pub enum ShardMsg {
         at_scaled: f64,
     },
     ClockReset(RxRef),
+    /// Stats-push fields for one receiver: (peer_count, outlier_percent,
+    /// quarantined).
+    ReceiverStats(RxRef, oneshot::Sender<Option<(usize, f64, bool)>>),
     Stats(oneshot::Sender<(usize, u64, u64, u64)>),
     SyncJson(oneshot::Sender<serde_json::Value>),
 }
@@ -187,6 +190,9 @@ pub async fn run_shard(
                     }
                     ShardMsg::Mlat { rx, t, m, at_scaled } => state.on_mlat(rx, t, &m, at_scaled),
                     ShardMsg::ClockReset(rx) => state.clock_reset(rx),
+                    ShardMsg::ReceiverStats(rx, reply) => {
+                        let _ = reply.send(state.receiver_stats(rx));
+                    }
                     ShardMsg::Stats(reply) => {
                         let _ = reply.send((
                             state.live_receivers(),

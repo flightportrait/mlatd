@@ -40,7 +40,8 @@ pub struct PairModel {
 }
 
 impl PairModel {
-    pub fn push(&mut self, t_from: f64, t_to: f64) {
+    /// Returns false when the observation was rejected by the outlier gate.
+    pub fn push(&mut self, t_from: f64, t_to: f64) -> bool {
         // Online gate once warm: a wild pair observation is refused, not
         // averaged in. Too many in a row = clock jump = reset.
         if self.usable() {
@@ -52,7 +53,7 @@ impl PairModel {
                 if self.rejects >= RESET_AFTER_REJECTS {
                     *self = PairModel::default();
                 }
-                return;
+                return false;
             }
             self.rejects = 0;
             // Track residual variance before this observation updates the fit.
@@ -70,6 +71,7 @@ impl PairModel {
         self.caa = self.caa * LAMBDA + da * (t_from - self.ma);
         self.cab = self.cab * LAMBDA + da * (t_to - self.mb);
         self.n_total += 1;
+        true
     }
 
     fn predict_unchecked(&self, t_from: f64) -> (f64, f64) {

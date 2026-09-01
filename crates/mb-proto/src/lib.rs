@@ -105,6 +105,9 @@ pub struct Handshake {
     pub selective_traffic: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub heartbeat: Option<bool>,
+    /// Client asks for the per-receiver stats push (wiedehopf extension).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub return_stats: Option<bool>,
 }
 
 impl Handshake {
@@ -201,6 +204,9 @@ pub enum ServerMsg {
     },
     Deny(serde_json::Value),
     Result(serde_json::Value),
+    /// Per-receiver stats push (wiedehopf extension): peer_count,
+    /// bad_sync_timeout, outlier_percent.
+    Stats(serde_json::Value),
     StartSending(Vec<String>),
     StopSending(Vec<String>),
     Heartbeat {
@@ -237,6 +243,9 @@ impl ServerMsg {
         if let Some(h) = obj.get("heartbeat") {
             let server_time = h.get("server_time").and_then(|t| t.as_f64());
             return Ok(ServerMsg::Heartbeat { server_time });
+        }
+        if let Some(st) = obj.get("stats") {
+            return Ok(ServerMsg::Stats(st.clone()));
         }
         if let Some(s) = obj.get("start_sending") {
             return Ok(ServerMsg::StartSending(string_list(s)));
@@ -309,6 +318,7 @@ mod tests {
             client_version: Some("mlat-bench 0.1.0".into()),
             selective_traffic: None,
             heartbeat: None,
+            return_stats: None,
         };
         let line = h.to_line();
         assert_eq!(*line.last().unwrap(), b'\n');

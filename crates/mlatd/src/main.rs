@@ -386,6 +386,7 @@ async fn handle_client(
         .map_err(|_| anyhow::anyhow!("shard gone"))?;
     let rx = orx.await.map_err(|_| anyhow::anyhow!("shard gone"))?;
     let wants_results = hs["return_results"].as_bool().unwrap_or(false);
+    let wants_stats = hs["return_stats"].as_bool().unwrap_or(false);
     // A real mlat-client sends no traffic until asked: selective traffic is
     // the request channel (observed with 5 real clients: connected, decoded
     // Beast, sent nothing). Do what mlat-server does: enable it, request
@@ -393,6 +394,7 @@ async fn handle_client(
     let reply = format!(
         "{{\"compress\":\"{negotiated}\",\"reconnect_in\":300,\"selective_traffic\":true,\
          \"heartbeat\":true,\"return_results\":{wants_results},\"rate_reports\":true,\
+         \"return_stats\":{wants_stats},\
          \"motd\":\"mlat-bench candidate mlatd\"}}\n"
     );
     wr.write_all(reply.as_bytes()).await?;
@@ -468,6 +470,10 @@ async fn handle_client(
     const IDLE: Duration = Duration::from_secs(300);
     let mut hb = tokio::time::interval(hb_real);
     hb.tick().await; // consume immediate first tick
+                     // Per-receiver stats push, every 15 s when the client asked for it
+                     // (mlat-client always does; its --stats-json file is built from this).
+    let mut stats_tick = tokio::time::interval(Duration::from_secs(15));
+    stats_tick.tick().await;
     let mut zdec = if negotiated == "none" {
         None
     } else {
@@ -484,6 +490,9 @@ async fn handle_client(
                         _ = hb.tick() => {
                             let st = scaled_now(conn_t0_unix, conn_t0, time_scale);
                             let _ = tx_line.send(format!("{{\"heartbeat\":{{\"server_time\":{st:.3}}}}}\n")).await;
+                        }
+                        _ = stats_tick.tick(), if wants_stats => {
+                            push_stats(&shard, rx, &tx_line).await;
                         }
                         r = tokio::time::timeout(IDLE, limited.read_until(b'\n', &mut line)) => {
                             let n = r.context("idle for 5 minutes")??;
@@ -505,6 +514,10 @@ async fn handle_client(
                         _ = hb.tick() => {
                             let st = scaled_now(conn_t0_unix, conn_t0, time_scale);
                             let _ = tx_line.send(format!("{{\"heartbeat\":{{\"server_time\":{st:.3}}}}}\n")).await;
+                            continue
+                        }
+                        _ = stats_tick.tick(), if wants_stats => {
+                            push_stats(&shard, rx, &tx_line).await;
                             continue
                         }
                         r = tokio::time::timeout(IDLE, rd.read_exact(&mut lenb)) => {
@@ -543,6 +556,31 @@ async fn handle_client(
     let _ = writer.await;
     println!("mlatd: {user} disconnected");
     res
+}
+
+/// One stats push: mlat-server's per-receiver triple, same field names.
+async fn push_stats(
+    shard: &Arc<ShardHandle>,
+    rx: crate::state::RxRef,
+    tx_line: &tokio::sync::mpsc::Sender<String>,
+) {
+    let (otx, orx) = oneshot::channel();
+    if shard
+        .tx
+        .send(ShardMsg::ReceiverStats(rx, otx))
+        .await
+        .is_err()
+    {
+        return;
+    }
+    if let Ok(Some((peers, outlier_percent, quarantined))) = orx.await {
+        let bad_sync_timeout = if quarantined { 60 } else { 0 };
+        let _ = tx_line
+            .send(format!(
+                "{{\"stats\":{{\"peer_count\":{peers},\"bad_sync_timeout\":{bad_sync_timeout},\"outlier_percent\":{outlier_percent:.1}}}}}\n"
+            ))
+            .await;
+    }
 }
 
 /// seen/rate_report trigger start_sending for aircraft not yet requested on

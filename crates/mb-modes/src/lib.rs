@@ -9,6 +9,8 @@
 //! Validation: byte-exact reproduction of real captured frames (the
 //! canonical 40621D pair) and encode/decode round-trip tests.
 
+pub use mb_core::Icao;
+
 pub mod alt;
 pub mod cpr;
 pub mod decode;

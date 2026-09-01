@@ -100,6 +100,10 @@ pub struct State {
     /// transport latency; rises slowly to follow reference-clock drift.
     stamp_offset: HashMap<usize, f64>,
     rx_bias: Vec<RxBias>,
+    /// Rolling per-receiver sync counters for the stats push: (accepted,
+    /// gate-rejected). Decayed by 0.25 at each stats read, as mlat-server
+    /// decays its equivalents.
+    rx_sync: Vec<(f64, f64)>,
     pub receivers: Vec<ReceiverInfo>,
     /// Slot generation, bumped on every reuse. Messages from a connection
     /// that lost its slot (reconnect dedupe, disconnect race) carry a stale
@@ -142,6 +146,7 @@ impl State {
             mlat_adsb,
             emit_filtered,
             rx_bias: Vec::new(),
+            rx_sync: Vec::new(),
             receivers: Vec::new(),
             gens: Vec::new(),
             alive: Vec::new(),
@@ -198,6 +203,7 @@ impl State {
             Some(i) => {
                 self.receivers[i] = info;
                 self.rx_bias[i] = RxBias::default();
+                self.rx_sync[i] = (0.0, 0.0);
                 self.gens[i] = self.gens[i].wrapping_add(1);
                 self.alive[i] = true;
                 i
@@ -205,6 +211,7 @@ impl State {
             None => {
                 self.receivers.push(info);
                 self.rx_bias.push(RxBias::default());
+                self.rx_sync.push((0.0, 0.0));
                 self.gens.push(0);
                 self.alive.push(true);
                 self.receivers.len() - 1
@@ -348,8 +355,14 @@ impl State {
                 continue;
             }
             for (a, b, ta, tb) in [(rx, rx2, te, te2), (rx, rx2, to, to2)] {
-                self.pairs.entry((a, b)).or_default().push(ta, tb);
+                let ok = self.pairs.entry((a, b)).or_default().push(ta, tb);
                 self.pairs.entry((b, a)).or_default().push(tb, ta);
+                let slot = &mut self.rx_sync[rx];
+                if ok {
+                    slot.0 += 1.0;
+                } else {
+                    slot.1 += 1.0;
+                }
                 self.stats_sync_obs += 1;
             }
         }
@@ -398,6 +411,30 @@ impl State {
                 entries: Vec::new(),
             });
         g.entries.push((rx, t_s, at_scaled));
+    }
+
+    /// One receiver's stats-push fields: (peer_count, outlier_percent,
+    /// quarantined). Reading decays the rolling counters.
+    pub fn receiver_stats(&mut self, r: RxRef) -> Option<(usize, f64, bool)> {
+        if !self.live(r) {
+            return None;
+        }
+        let rx = r.idx;
+        let peers = self
+            .pairs
+            .keys()
+            .filter(|(a, b)| *a == rx && self.alive[*b])
+            .count();
+        let (acc, rej) = self.rx_sync[rx];
+        let outlier_percent = if acc + rej > 0.0 {
+            100.0 * rej / (acc + rej)
+        } else {
+            0.0
+        };
+        self.rx_sync[rx] = (acc * 0.25, rej * 0.25);
+        let b = self.rx_bias[rx];
+        let quarantined = b.n >= QUARANTINE_MIN_N && b.mad_s > QUARANTINE_MAD_S;
+        Some((peers, outlier_percent, quarantined))
     }
 
     pub fn live_receivers(&self) -> usize {

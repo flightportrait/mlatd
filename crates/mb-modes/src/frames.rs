@@ -44,6 +44,41 @@ pub fn df17_airborne_position(
     Some(f)
 }
 
+/// DF18 TIS-B fine position pair (CF=2, IMF=0), the synthetic frames
+/// mlat-client emits on its Beast results output so readsb ingests MLAT
+/// positions. Both frames carry the same position; ME type 18 (NUCp 0),
+/// as the real client builds them (synthetic_es.py).
+pub fn df18_position_pair(
+    icao: Icao,
+    alt_ft: i32,
+    lat_deg: f64,
+    lon_deg: f64,
+) -> Option<[[u8; 14]; 2]> {
+    let alt12 = alt::ac12(alt_ft)? as u64;
+    let mut out = [[0u8; 14]; 2];
+    for (i, odd) in [false, true].into_iter().enumerate() {
+        let (yz, xz) = cpr::encode_airborne(lat_deg, lon_deg, odd);
+        let me: u64 = (18u64 << 51)
+            | (alt12 << 36)
+            | ((odd as u64) << 34)
+            | ((yz as u64) << 17)
+            | (xz as u64);
+        let f = &mut out[i];
+        f[0] = (18 << 3) | 2;
+        f[1] = (icao.0 >> 16) as u8;
+        f[2] = (icao.0 >> 8) as u8;
+        f[3] = icao.0 as u8;
+        for j in 0..7 {
+            f[4 + j] = (me >> (48 - 8 * j)) as u8;
+        }
+        let p = crc24(&f[..11]);
+        f[11] = (p >> 16) as u8;
+        f[12] = (p >> 8) as u8;
+        f[13] = p as u8;
+    }
+    Some(out)
+}
+
 /// DF11 all-call reply / acquisition squitter, 7 bytes.
 /// PI = parity XOR interrogator ID; spontaneous squitters use II=0,
 /// so PI is the bare CRC and any receiver can recover the address.
@@ -88,6 +123,21 @@ mod tests {
     /// (the canonical pair from the 1090 MHz literature, icao 40621D,
     /// 38000 ft). If this passes, encoder, CPR, altitude, and CRC all agree
     /// with the real world at once.
+    #[test]
+    fn df18_pair_is_valid_and_decodes() {
+        let [even, odd] = df18_position_pair(Icao(0x4D0123), 27600, 1.29, 103.85).unwrap();
+        for f in [&even, &odd] {
+            assert_eq!(f[0], 0x92, "DF18, CF=2");
+            assert_eq!(crc24(&f[..]), 0, "parity must validate");
+        }
+        let cpr_of = |f: &[u8; 14]| {
+            let me = u64::from_be_bytes([0, f[4], f[5], f[6], f[7], f[8], f[9], f[10]]);
+            (((me >> 17) & 0x1FFFF) as u32, (me & 0x1FFFF) as u32)
+        };
+        let (plat, plon) = cpr::global_decode_airborne(cpr_of(&even), cpr_of(&odd), true).unwrap();
+        assert!((plat - 1.29).abs() < 0.001 && (plon - 103.85).abs() < 0.001);
+    }
+
     #[test]
     fn golden_frame_even() {
         let f = df17_airborne_position(
