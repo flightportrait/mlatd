@@ -44,8 +44,10 @@ or more feeders with overlapping coverage produce positions.
 - `work/selftruth.csv`: mlatd also multilaterates ADS-B aircraft and
   compares each fix with the position the aircraft transmitted. This is
   live accuracy measurement without ground truth
-  (rows: t,icao,err_m,est_m,n). In the latest reference run the
-  estimate read p50 131 m where external truth measured 128 m.
+  (rows: t,icao,err_m,est_m,n). Calibration on reference data: the
+  estimate reads ~1.3-1.4x above the true error (reported p50 131 m
+  where external truth measured 92 m); treat it as a conservative
+  upper bound.
 
 ## 4. The rigorous comparison, when you want it
 
