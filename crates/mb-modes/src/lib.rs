@@ -1,13 +1,13 @@
 //! Mode S frame encoding. Pure functions, no I/O.
 //!
 //! - `crc24` (poly 0xFFF409); AP/PI application lives in the frame builders
-//! - `cpr`: airborne even/odd encode + NL function + global decode (for tests
-//!   and metrics — the oracle judges with its own)
+//! - `cpr`: airborne even/odd encode + NL function + global decode (used by
+//!   the mlatd server, the scorer, and tests)
 //! - `alt`: AC12/AC13 altitude encoding (25 ft Q-bit paths only)
 //! - `frames`: df17_airborne_position / df11 / df4 builders
 //!
-//! Validation: byte-exact reproduction of real captured frames (the canonical
-//! 40621D pair) + round-trip against adsb_deku (dev-dep only).
+//! Validation: byte-exact reproduction of real captured frames (the
+//! canonical 40621D pair) and encode/decode round-trip tests.
 
 pub mod alt;
 pub mod cpr;

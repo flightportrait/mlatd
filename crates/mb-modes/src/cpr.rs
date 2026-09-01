@@ -1,8 +1,8 @@
 //! Compact Position Reporting (CPR), airborne format.
 //!
-//! Encoding must be exact: the oracle globally decodes every sync pair
-//! (mlat-server clocktrack.pyx:432) and drops pairs whose decode fails or
-//! lands outside its range gates. See docs/protocol-notes.md.
+//! Encoding must be exact: mlat-server globally decodes every sync pair
+//! (clocktrack.pyx:432) and drops pairs whose decode fails or lands
+//! outside its range gates. See docs/protocol-notes.md.
 //!
 //! Conventions follow the usual references (ICAO Annex 10 Vol IV; mode-s.org):
 //! NZ = 15, 17-bit encoded lat/lon, even i=0 / odd i=1.

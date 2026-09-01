@@ -44,12 +44,12 @@ or more feeders with overlapping coverage produce positions.
 - `work/selftruth.csv`: mlatd also multilaterates ADS-B aircraft and
   compares each fix with the position the aircraft transmitted. This is
   live accuracy measurement without ground truth
-  (rows: t,icao,err_m,est_m,n). On reference data this estimate reads
-  ~25 % above true error.
+  (rows: t,icao,err_m,est_m,n). In the latest reference run the
+  estimate read p50 131 m where external truth measured 128 m.
 
 ## 4. The rigorous comparison, when you want it
 
-[mlat-bench](https://github.com/yoanntlm/mlat-bench) replays identical
+mlat-bench, our replay harness (publication pending), replays identical
 traffic to two servers and scores both. Its `record` subcommand is a
 transparent proxy: feeders connect to it, it forwards to your existing
 mlat-server unchanged and writes a capture. `replay` then feeds that

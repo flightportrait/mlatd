@@ -7,12 +7,11 @@ selective traffic, the result messages, the `sync.json` file, and the
 flag names are the same. The server is one Rust binary.
 
 Status: pre-release. We benchmark mlatd against mlat-server with
-replayed real traffic in [mlat-bench]. There is no long production
-deployment yet.
+replayed real traffic in mlat-bench, our replay harness (publication
+pending). There is no long production deployment yet.
 
 [mlat-client]: https://github.com/mutability/mlat-client
 [wiedehopf/mlat-server]: https://github.com/wiedehopf/mlat-server
-[mlat-bench]: https://github.com/yoanntlm/mlat-bench
 
 ## Design
 
@@ -72,11 +71,11 @@ To migrate from mlat-server, read [docs/MIGRATION.md](docs/MIGRATION.md).
 
 ## Development
 
-We develop mlatd against [mlat-bench]. The bench replays captured
-traffic and compares server output with known ground truth. The
-benchmark results and the method are in that repository. Before the
-public launch, the `crates/` directory here is a copy from that
-workspace (its `tools/publish_mlatd.sh`). The packaging and the
+We develop mlatd against mlat-bench, a replay harness that scores a
+server's output against known ground truth over the real wire
+protocol. That repository, with the benchmark results and the method,
+is not public yet; it follows. Until then, the `crates/` directory
+here is a copy published from that workspace; the packaging and the
 documentation are written in this repository.
 
 ## Credit

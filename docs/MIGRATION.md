@@ -41,7 +41,7 @@ selective traffic. The migration is a server-side swap.
 
 ## Test the swap with your own traffic
 
-The [mlat-bench](https://github.com/yoanntlm/mlat-bench) `record`
+The mlat-bench `record`
 proxy copies live feeder traffic to a capture file. `replay` sends the
 same capture to your mlat-server and to mlatd. `score` and `diff`
 compare the two runs. Ten minutes of traffic is sufficient for a
