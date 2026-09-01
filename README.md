@@ -73,6 +73,13 @@ columns.
 
 To migrate from mlat-server, read [docs/MIGRATION.md](docs/MIGRATION.md).
 
+## Roadmap
+
+- Adaptive partition: density-split cells and rate-weighted shard
+  capacity, so the two `--shard-*` dials become unnecessary.
+- On request: UDP transport, the filtered-basestation listener,
+  `--status-interval`.
+
 ## Development
 
 We develop mlatd against [mlat-bench], a replay harness that scores a
