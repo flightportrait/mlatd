@@ -63,6 +63,9 @@ the JSON handshake with `compress` none, zlib, and zlib2; selective
 traffic; sync and mlat messages for all documented clock types; result
 return; SBS output; `sync.json`; the mlat-server flag aliases.
 
+The server also emits the per-receiver stats push (`return_stats`),
+which mlat-client turns into its `--stats-json` file.
+
 These functions are not implemented: UDP transport, the
 filtered-basestation listener, `--status-interval`, Kalman result
 columns.
