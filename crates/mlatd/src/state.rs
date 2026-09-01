@@ -93,6 +93,13 @@ pub struct State {
     stamp_offset: HashMap<usize, f64>,
     rx_bias: Vec<RxBias>,
     pub receivers: Vec<ReceiverInfo>,
+    /// Slot generation, bumped on every reuse. Messages from a connection
+    /// that lost its slot (reconnect dedupe, disconnect race) carry a stale
+    /// generation and are ignored.
+    gens: Vec<u32>,
+    alive: Vec<bool>,
+    free_slots: Vec<usize>,
+    by_user: HashMap<String, usize>,
     reference: Option<usize>,
     pairs: HashMap<(usize, usize), PairModel>,
     syncpoints: HashMap<(String, String), SyncPoint>,
@@ -128,6 +135,10 @@ impl State {
             emit_filtered,
             rx_bias: Vec::new(),
             receivers: Vec::new(),
+            gens: Vec::new(),
+            alive: Vec::new(),
+            free_slots: Vec::new(),
+            by_user: HashMap::new(),
             reference: None,
             pairs: HashMap::new(),
             syncpoints: HashMap::new(),
@@ -163,22 +174,62 @@ impl State {
         self.t0_unix + self.t0_real.elapsed().as_secs_f64() * self.time_scale
     }
 
-    pub fn add_receiver(&mut self, info: ReceiverInfo) -> usize {
-        self.rx_bias.push(RxBias::default());
+    pub fn add_receiver(&mut self, info: ReceiverInfo) -> (usize, u32) {
+        // A reconnect of the same user replaces the old slot: real feeders
+        // leave half-open sockets behind, and the old connection's late
+        // messages die on the generation check.
+        if let Some(&old) = self.by_user.get(&info.user) {
+            let gen = self.gens[old];
+            self.remove_receiver(old, gen);
+        }
         let gps = info.gps;
-        self.receivers.push(info);
-        let idx = self.receivers.len() - 1;
-        // A GPS-disciplined clock is the best possible hub for the pairwise
-        // star; otherwise first-connected serves.
+        let user = info.user.clone();
+        let idx = match self.free_slots.pop() {
+            Some(i) => {
+                self.receivers[i] = info;
+                self.rx_bias[i] = RxBias::default();
+                self.gens[i] = self.gens[i].wrapping_add(1);
+                self.alive[i] = true;
+                i
+            }
+            None => {
+                self.receivers.push(info);
+                self.rx_bias.push(RxBias::default());
+                self.gens.push(0);
+                self.alive.push(true);
+                self.receivers.len() - 1
+            }
+        };
+        self.by_user.insert(user, idx);
         match self.reference {
             None => self.reference = Some(idx),
             Some(r) if gps && !self.receivers[r].gps => self.reference = Some(idx),
             _ => {}
         }
-        idx
+        (idx, self.gens[idx])
     }
 
-    pub fn clock_reset(&mut self, rx: usize) {
+    pub fn remove_receiver(&mut self, rx: usize, gen: u32) {
+        if !self.live(rx, gen) {
+            return;
+        }
+        self.alive[rx] = false;
+        self.pairs.retain(|(a, b), _| *a != rx && *b != rx);
+        self.stamp_offset.remove(&rx);
+        if self.by_user.get(&self.receivers[rx].user) == Some(&rx) {
+            self.by_user.remove(&self.receivers[rx].user);
+        }
+        self.free_slots.push(rx);
+    }
+
+    fn live(&self, rx: usize, gen: u32) -> bool {
+        rx < self.receivers.len() && self.alive[rx] && self.gens[rx] == gen
+    }
+
+    pub fn clock_reset(&mut self, rx: usize, gen: u32) {
+        if !self.live(rx, gen) {
+            return;
+        }
         self.pairs.retain(|(a, b), _| *a != rx && *b != rx);
     }
 
@@ -187,12 +238,16 @@ impl State {
     pub fn on_sync(
         &mut self,
         rx: usize,
+        gen: u32,
         et: f64,
         ot: f64,
         em_hex: &str,
         om_hex: &str,
         at_scaled: f64,
     ) {
+        if !self.live(rx, gen) {
+            return;
+        }
         let (Ok(em), Ok(om)) = (hex::decode(em_hex), hex::decode(om_hex)) else {
             return;
         };
@@ -254,7 +309,7 @@ impl State {
             // Feed the even DF17 into the mlat grouping path as well: its
             // per-receiver timestamps make ADS-B aircraft multilateratable,
             // and their broadcast position scores the solve (selftruth.csv).
-            self.on_mlat(rx, et, em_hex, at_scaled);
+            self.on_mlat(rx, gen, et, em_hex, at_scaled);
         }
 
         let sp = self
@@ -275,7 +330,7 @@ impl State {
         let others: Vec<(usize, f64, f64)> = sp.reporters.clone();
         sp.reporters.push((rx, te, to));
         for (rx2, te2, to2) in others {
-            if rx2 == rx {
+            if rx2 == rx || !self.alive[rx2] {
                 continue;
             }
             for (a, b, ta, tb) in [(rx, rx2, te, te2), (rx, rx2, to, to2)] {
@@ -287,7 +342,10 @@ impl State {
     }
 
     /// An mlat message: group identical frames across receivers.
-    pub fn on_mlat(&mut self, rx: usize, t_counts: f64, m_hex: &str, at_scaled: f64) {
+    pub fn on_mlat(&mut self, rx: usize, gen: u32, t_counts: f64, m_hex: &str, at_scaled: f64) {
+        if !self.live(rx, gen) {
+            return;
+        }
         let Ok(m) = hex::decode(m_hex) else { return };
         let icao = match mb_modes::decode::df_of(&m) {
             Some(17) => {
@@ -325,6 +383,10 @@ impl State {
                 entries: Vec::new(),
             });
         g.entries.push((rx, t_s, at_scaled));
+    }
+
+    pub fn live_receivers(&self) -> usize {
+        self.alive.iter().filter(|a| **a).count()
     }
 
     /// Sweep: solve groups older than the window, expire stale sync points.
@@ -457,7 +519,7 @@ impl State {
         let mut rx_ids: Vec<usize> = Vec::new();
         let mut stamp = f64::INFINITY;
         for &(rx, t, sigma, at_scaled) in cluster {
-            if !seen.insert(rx) {
+            if !seen.insert(rx) || !self.alive[rx] {
                 continue;
             }
             // Apply the learned systematic bias: residual = predicted −
@@ -737,6 +799,9 @@ impl State {
     pub fn sync_json(&self) -> serde_json::Value {
         let mut top = serde_json::Map::new();
         for (i, r) in self.receivers.iter().enumerate() {
+            if !self.alive[i] {
+                continue;
+            }
             let mut peers = serde_json::Map::new();
             for ((a, b), pm) in &self.pairs {
                 if *a == i {
@@ -808,4 +873,73 @@ fn sbs_datetime(unix: f64) -> (String, String) {
 
 fn dist(a: &Ecef, b: &Ecef) -> f64 {
     ((a.x - b.x).powi(2) + (a.y - b.y).powi(2) + (a.z - b.z).powi(2)).sqrt()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rx_info(user: &str) -> ReceiverInfo {
+        let geo = Geodetic {
+            lat_deg: 47.0,
+            lon_deg: -1.5,
+            alt_m: 40.0,
+        };
+        ReceiverInfo {
+            user: user.into(),
+            ecef: geo.to_ecef(),
+            geo,
+            freq_hz: 12e6,
+            gps: false,
+            jitter_s: 150e-9,
+        }
+    }
+
+    fn state() -> State {
+        State::new(1.0, false, false, (0.0, Instant::now()))
+    }
+
+    #[test]
+    fn slots_are_reused_after_removal() {
+        let mut s = state();
+        let (a, ga) = s.add_receiver(rx_info("a"));
+        let (b, _) = s.add_receiver(rx_info("b"));
+        assert_eq!((a, b), (0, 1));
+        s.remove_receiver(a, ga);
+        assert_eq!(s.live_receivers(), 1);
+        let (c, gc) = s.add_receiver(rx_info("c"));
+        assert_eq!(c, a, "freed slot is reused");
+        assert_ne!(gc, ga, "reuse bumps the generation");
+        assert_eq!(s.receivers.len(), 2, "no growth on reconnect churn");
+    }
+
+    #[test]
+    fn same_user_reconnect_replaces_the_old_slot() {
+        let mut s = state();
+        let (a, ga) = s.add_receiver(rx_info("stn"));
+        let (b, gb) = s.add_receiver(rx_info("stn"));
+        assert_eq!(s.live_receivers(), 1);
+        assert_eq!(b, a, "same user takes the same slot back");
+        assert_ne!(gb, ga);
+        // The zombie connection's teardown must not free the new slot.
+        s.remove_receiver(a, ga);
+        assert_eq!(s.live_receivers(), 1);
+    }
+
+    #[test]
+    fn stale_generation_messages_are_ignored() {
+        let mut s = state();
+        let (a, ga) = s.add_receiver(rx_info("a"));
+        s.remove_receiver(a, ga);
+        let (b, gb) = s.add_receiver(rx_info("b"));
+        assert_eq!(b, a);
+        s.clock_reset(a, ga); // stale; must not touch b's pairs
+        s.on_mlat(a, ga, 1000.0, "20000f1f10ce93", 0.0);
+        s.sweep(std::time::Duration::from_secs(0));
+        assert_eq!(s.stats_solved + s.stats_rejected, 0);
+        let json = s.sync_json();
+        let keys: Vec<&String> = json.as_object().unwrap().keys().collect();
+        assert_eq!(keys, ["b"], "sync.json lists only live receivers");
+        let _ = gb;
+    }
 }

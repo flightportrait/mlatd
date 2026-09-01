@@ -310,14 +310,21 @@ async fn handle_client(
 
     // ---- handshake -------------------------------------------------------
     let mut hs_line = Vec::new();
-    rd.read_until(b'\n', &mut hs_line).await?;
-    if hs_line.is_empty() {
+    let n = tokio::time::timeout(
+        Duration::from_secs(15),
+        AsyncBufReadExt::read_until(&mut (&mut rd).take(64 * 1024), b'\n', &mut hs_line),
+    )
+    .await
+    .context("no handshake within 15 s")??;
+    if n == 0 {
         anyhow::bail!("closed before handshake");
     }
+    if hs_line.last() != Some(&b'\n') {
+        anyhow::bail!("handshake line over 64 KiB");
+    }
     let hs: serde_json::Value = serde_json::from_slice(&hs_line).context("handshake not JSON")?;
-    // Compression preference: none (cheapest to decode), else zlib2, else
-    // zlib. Real feeders overwhelmingly offer zlib2; denying it would
-    // reject most of the field.
+    // Compression preference: zlib2 first, mlat-server's order. At fleet
+    // scale the uplink is the feeders' home bandwidth; plain lines waste it.
     let offered: Vec<String> = hs["compress"]
         .as_array()
         .map(|a| {
@@ -326,7 +333,7 @@ async fn handle_client(
                 .collect()
         })
         .unwrap_or_default();
-    let negotiated = ["none", "zlib2", "zlib"]
+    let negotiated = ["zlib2", "zlib", "none"]
         .into_iter()
         .find(|m| offered.iter().any(|o| o == m));
     let Some(negotiated) = negotiated else {
@@ -377,7 +384,7 @@ async fn handle_client(
         ))
         .await
         .map_err(|_| anyhow::anyhow!("shard gone"))?;
-    let rx = orx.await.map_err(|_| anyhow::anyhow!("shard gone"))?;
+    let (rx, gen) = orx.await.map_err(|_| anyhow::anyhow!("shard gone"))?;
     let wants_results = hs["return_results"].as_bool().unwrap_or(false);
     // A real mlat-client sends no traffic until asked: selective traffic is
     // the request channel (observed with 5 real clients: connected, decoded
@@ -392,12 +399,54 @@ async fn handle_client(
     println!("mlatd: {user} connected ({clock_type}, {negotiated})");
 
     // Single writer task: heartbeats and (if subscribed) result messages
-    // funnel through one mpsc so the socket has exactly one writer.
+    // funnel through one mpsc so the socket has exactly one writer. On
+    // zlib2 the downlink is compressed with the same framing as the uplink
+    // (jsonclient.py maps zlib2 to write_zlib; zlib and none to write_raw),
+    // batched up to 1 s.
     let (tx_line, mut rx_line) = tokio::sync::mpsc::channel::<String>(256);
+    let compress_down = negotiated == "zlib2";
     let writer = tokio::spawn(async move {
-        while let Some(l) = rx_line.recv().await {
-            if wr.write_all(l.as_bytes()).await.is_err() {
-                break;
+        if !compress_down {
+            while let Some(l) = rx_line.recv().await {
+                if wr.write_all(l.as_bytes()).await.is_err() {
+                    break;
+                }
+            }
+            return;
+        }
+        let mut enc = mb_proto::framing::ZlibFrameEncoder::new();
+        let mut batch: Vec<u8> = Vec::new();
+        let mut flush = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            tokio::select! {
+                l = rx_line.recv() => {
+                    let Some(l) = l else { break };
+                    batch.extend_from_slice(l.as_bytes());
+                    if batch.len() < 32 * 1024 {
+                        continue;
+                    }
+                    let Ok(f) = enc.encode_frame(&batch) else { break };
+                    batch.clear();
+                    if wr.write_all(&f).await.is_err() {
+                        break;
+                    }
+                }
+                _ = flush.tick() => {
+                    if batch.is_empty() {
+                        continue;
+                    }
+                    let Ok(f) = enc.encode_frame(&batch) else { break };
+                    batch.clear();
+                    if wr.write_all(&f).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+        // Flush what the loop left behind.
+        if !batch.is_empty() {
+            if let Ok(f) = enc.encode_frame(&batch) {
+                let _ = wr.write_all(&f).await;
             }
         }
     });
@@ -414,6 +463,9 @@ async fn handle_client(
     }
 
     // ---- message loop ----------------------------------------------------
+    // A connection silent for 5 minutes is dead (real clients heartbeat
+    // every 30 s); reap it so churned feeders do not accumulate.
+    const IDLE: Duration = Duration::from_secs(300);
     let mut hb = tokio::time::interval(hb_real);
     hb.tick().await; // consume immediate first tick
     let mut zdec = if negotiated == "none" {
@@ -422,60 +474,75 @@ async fn handle_client(
         Some(ZlibFrameDecoder::new())
     };
     let mut requested: std::collections::HashSet<String> = std::collections::HashSet::new();
-    loop {
-        match &mut zdec {
-            None => {
-                let mut line = Vec::new();
-                tokio::select! {
-                    _ = hb.tick() => {
-                        let st = scaled_now(conn_t0_unix, conn_t0, time_scale);
-                        let _ = tx_line.send(format!("{{\"heartbeat\":{{\"server_time\":{st:.3}}}}}\n")).await;
-                    }
-                    r = rd.read_until(b'\n', &mut line) => {
-                        if r? == 0 { break }
-                        let now_s = scaled_now(conn_t0_unix, conn_t0, time_scale);
-                        process_line_tx(&shard, rx, &line, Some(&tx_line), &mut requested, now_s).await;
-                    }
-                }
-            }
-            Some(dec) => {
-                // Framed: 2-byte BE length + zlib payload with persistent
-                // dictionary state (mb-proto framing; the same code the
-                // capture generator uses, exercised from the other side).
-                let mut lenb = [0u8; 2];
-                tokio::select! {
-                    _ = hb.tick() => {
-                        let st = scaled_now(conn_t0_unix, conn_t0, time_scale);
-                        let _ = tx_line.send(format!("{{\"heartbeat\":{{\"server_time\":{st:.3}}}}}\n")).await;
-                        continue
-                    }
-                    r = rd.read_exact(&mut lenb) => {
-                        if r.is_err() { break }
+    let res: Result<()> = async {
+        loop {
+            match &mut zdec {
+                None => {
+                    let mut line = Vec::new();
+                    let mut limited = (&mut rd).take(256 * 1024);
+                    tokio::select! {
+                        _ = hb.tick() => {
+                            let st = scaled_now(conn_t0_unix, conn_t0, time_scale);
+                            let _ = tx_line.send(format!("{{\"heartbeat\":{{\"server_time\":{st:.3}}}}}\n")).await;
+                        }
+                        r = tokio::time::timeout(IDLE, limited.read_until(b'\n', &mut line)) => {
+                            let n = r.context("idle for 5 minutes")??;
+                            if n == 0 { break }
+                            if line.last() != Some(&b'\n') {
+                                anyhow::bail!("line over 256 KiB");
+                            }
+                            let now_s = scaled_now(conn_t0_unix, conn_t0, time_scale);
+                            process_line_tx(&shard, rx, gen, &line, Some(&tx_line), &mut requested, now_s).await;
+                        }
                     }
                 }
-                let want = u16::from_be_bytes(lenb) as usize;
-                let mut payload = vec![0u8; 2 + want];
-                payload[..2].copy_from_slice(&lenb);
-                if rd.read_exact(&mut payload[2..]).await.is_err() {
-                    break;
-                }
-                let Ok(chunk) = dec.decode_frame(&payload) else {
-                    anyhow::bail!("zlib frame decode failed for {user}");
-                };
-                let now_s = scaled_now(conn_t0_unix, conn_t0, time_scale);
-                for line in chunk.split(|b| *b == b'\n') {
-                    if !line.is_empty() {
-                        process_line_tx(&shard, rx, line, Some(&tx_line), &mut requested, now_s)
-                            .await;
+                Some(dec) => {
+                    // Framed: 2-byte BE length + zlib payload with persistent
+                    // dictionary state (mb-proto framing; the same code the
+                    // capture generator uses, exercised from the other side).
+                    let mut lenb = [0u8; 2];
+                    tokio::select! {
+                        _ = hb.tick() => {
+                            let st = scaled_now(conn_t0_unix, conn_t0, time_scale);
+                            let _ = tx_line.send(format!("{{\"heartbeat\":{{\"server_time\":{st:.3}}}}}\n")).await;
+                            continue
+                        }
+                        r = tokio::time::timeout(IDLE, rd.read_exact(&mut lenb)) => {
+                            if r.context("idle for 5 minutes")?.is_err() { break }
+                        }
+                    }
+                    let want = u16::from_be_bytes(lenb) as usize;
+                    let mut payload = vec![0u8; 2 + want];
+                    payload[..2].copy_from_slice(&lenb);
+                    if rd.read_exact(&mut payload[2..]).await.is_err() {
+                        break;
+                    }
+                    let Ok(chunk) = dec.decode_frame(&payload) else {
+                        anyhow::bail!("zlib frame decode failed for {user}");
+                    };
+                    let now_s = scaled_now(conn_t0_unix, conn_t0, time_scale);
+                    for line in chunk.split(|b| *b == b'\n') {
+                        if !line.is_empty() {
+                            process_line_tx(&shard, rx, gen, line, Some(&tx_line), &mut requested, now_s)
+                                .await;
+                        }
                     }
                 }
             }
         }
+        Ok(())
     }
+    .await;
+    // Free the slot on every exit path; the generation guard makes this
+    // safe against a same-user reconnect that already took the slot over.
+    let _ = shard.tx.send(ShardMsg::RemoveReceiver { rx, gen }).await;
+    shard
+        .receivers
+        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     drop(tx_line);
     let _ = writer.await;
     println!("mlatd: {user} disconnected");
-    Ok(())
+    res
 }
 
 /// seen/rate_report trigger start_sending for aircraft not yet requested on
@@ -483,6 +550,7 @@ async fn handle_client(
 async fn process_line_tx(
     shard: &Arc<ShardHandle>,
     rx: usize,
+    gen: u32,
     line: &[u8],
     tx: Option<&tokio::sync::mpsc::Sender<String>>,
     requested: &mut std::collections::HashSet<String>,
@@ -532,6 +600,7 @@ async fn process_line_tx(
             .tx
             .send(ShardMsg::Sync {
                 rx,
+                gen,
                 et,
                 ot,
                 em: em.to_string(),
@@ -547,13 +616,14 @@ async fn process_line_tx(
             .tx
             .send(ShardMsg::Mlat {
                 rx,
+                gen,
                 t,
                 m: m.to_string(),
                 at_scaled,
             })
             .await;
     } else if v.get("clock_reset").is_some() || v.get("clock_jump").is_some() {
-        let _ = shard.tx.send(ShardMsg::ClockReset { rx }).await;
+        let _ = shard.tx.send(ShardMsg::ClockReset { rx, gen }).await;
     }
     // seen/lost/heartbeat/rate_report/input_*: no state needed yet.
 }

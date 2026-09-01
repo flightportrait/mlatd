@@ -24,9 +24,14 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
 pub enum ShardMsg {
-    AddReceiver(ReceiverInfo, oneshot::Sender<usize>),
+    AddReceiver(ReceiverInfo, oneshot::Sender<(usize, u32)>),
+    RemoveReceiver {
+        rx: usize,
+        gen: u32,
+    },
     Sync {
         rx: usize,
+        gen: u32,
         et: f64,
         ot: f64,
         em: String,
@@ -38,12 +43,14 @@ pub enum ShardMsg {
     },
     Mlat {
         rx: usize,
+        gen: u32,
         t: f64,
         m: String,
         at_scaled: f64,
     },
     ClockReset {
         rx: usize,
+        gen: u32,
     },
     Stats(oneshot::Sender<(usize, u64, u64, u64)>),
     SyncJson(oneshot::Sender<serde_json::Value>),
@@ -180,17 +187,19 @@ pub async fn run_shard(
                 let Some(msg) = msg else { break };
                 match msg {
                     ShardMsg::AddReceiver(info, reply) => {
-                        let id = state.add_receiver(info);
-                        let _ = reply.send(id);
+                        let _ = reply.send(state.add_receiver(info));
                     }
-                    ShardMsg::Sync { rx, et, ot, em, om, at_scaled } => {
-                        state.on_sync(rx, et, ot, &em, &om, at_scaled)
+                    ShardMsg::RemoveReceiver { rx, gen } => state.remove_receiver(rx, gen),
+                    ShardMsg::Sync { rx, gen, et, ot, em, om, at_scaled } => {
+                        state.on_sync(rx, gen, et, ot, &em, &om, at_scaled)
                     }
-                    ShardMsg::Mlat { rx, t, m, at_scaled } => state.on_mlat(rx, t, &m, at_scaled),
-                    ShardMsg::ClockReset { rx } => state.clock_reset(rx),
+                    ShardMsg::Mlat { rx, gen, t, m, at_scaled } => {
+                        state.on_mlat(rx, gen, t, &m, at_scaled)
+                    }
+                    ShardMsg::ClockReset { rx, gen } => state.clock_reset(rx, gen),
                     ShardMsg::Stats(reply) => {
                         let _ = reply.send((
-                            state.receivers.len(),
+                            state.live_receivers(),
                             state.stats_sync_obs,
                             state.stats_solved,
                             state.stats_rejected,

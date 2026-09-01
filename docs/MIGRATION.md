@@ -32,6 +32,10 @@ selective traffic. The migration is a server-side swap.
   numbers, with the same meaning.
 - The server finds clock jumps for each receiver pair and resets the
   pair. No manual intervention is necessary.
+- Reconnects are cheap. A feeder that reconnects takes its old slot
+  back (matched by user name); the dead connection's state is freed and
+  its late messages are discarded. Connections silent for 5 minutes are
+  reaped.
 - Receiver coordinates arrive in the handshake. Bind the client port
   to a private interface (see `compose.example.yml`).
 

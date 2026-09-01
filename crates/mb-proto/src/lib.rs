@@ -100,6 +100,11 @@ pub struct Handshake {
     pub return_result_format: Option<String>, // "old" | "ecef"
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_version: Option<String>,
+    /// Client opts in to start_sending/stop_sending steering.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selective_traffic: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub heartbeat: Option<bool>,
 }
 
 impl Handshake {
@@ -302,6 +307,8 @@ mod tests {
             return_results: Some(true),
             return_result_format: None,
             client_version: Some("mlat-bench 0.1.0".into()),
+            selective_traffic: None,
+            heartbeat: None,
         };
         let line = h.to_line();
         assert_eq!(*line.last().unwrap(), b'\n');
