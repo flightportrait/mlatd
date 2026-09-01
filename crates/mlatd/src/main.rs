@@ -384,7 +384,7 @@ async fn handle_client(
         ))
         .await
         .map_err(|_| anyhow::anyhow!("shard gone"))?;
-    let (rx, gen) = orx.await.map_err(|_| anyhow::anyhow!("shard gone"))?;
+    let rx = orx.await.map_err(|_| anyhow::anyhow!("shard gone"))?;
     let wants_results = hs["return_results"].as_bool().unwrap_or(false);
     // A real mlat-client sends no traffic until asked: selective traffic is
     // the request channel (observed with 5 real clients: connected, decoded
@@ -492,7 +492,7 @@ async fn handle_client(
                                 anyhow::bail!("line over 256 KiB");
                             }
                             let now_s = scaled_now(conn_t0_unix, conn_t0, time_scale);
-                            process_line_tx(&shard, rx, gen, &line, Some(&tx_line), &mut requested, now_s).await;
+                            process_line_tx(&shard, rx, &line, Some(&tx_line), &mut requested, now_s).await;
                         }
                     }
                 }
@@ -523,7 +523,7 @@ async fn handle_client(
                     let now_s = scaled_now(conn_t0_unix, conn_t0, time_scale);
                     for line in chunk.split(|b| *b == b'\n') {
                         if !line.is_empty() {
-                            process_line_tx(&shard, rx, gen, line, Some(&tx_line), &mut requested, now_s)
+                            process_line_tx(&shard, rx, line, Some(&tx_line), &mut requested, now_s)
                                 .await;
                         }
                     }
@@ -535,7 +535,7 @@ async fn handle_client(
     .await;
     // Free the slot on every exit path; the generation guard makes this
     // safe against a same-user reconnect that already took the slot over.
-    let _ = shard.tx.send(ShardMsg::RemoveReceiver { rx, gen }).await;
+    let _ = shard.tx.send(ShardMsg::RemoveReceiver(rx)).await;
     shard
         .receivers
         .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
@@ -549,8 +549,7 @@ async fn handle_client(
 /// this connection; a real mlat-client sends nothing until asked.
 async fn process_line_tx(
     shard: &Arc<ShardHandle>,
-    rx: usize,
-    gen: u32,
+    rx: crate::state::RxRef,
     line: &[u8],
     tx: Option<&tokio::sync::mpsc::Sender<String>>,
     requested: &mut std::collections::HashSet<String>,
@@ -600,7 +599,6 @@ async fn process_line_tx(
             .tx
             .send(ShardMsg::Sync {
                 rx,
-                gen,
                 et,
                 ot,
                 em: em.to_string(),
@@ -616,14 +614,13 @@ async fn process_line_tx(
             .tx
             .send(ShardMsg::Mlat {
                 rx,
-                gen,
                 t,
                 m: m.to_string(),
                 at_scaled,
             })
             .await;
     } else if v.get("clock_reset").is_some() || v.get("clock_jump").is_some() {
-        let _ = shard.tx.send(ShardMsg::ClockReset { rx, gen }).await;
+        let _ = shard.tx.send(ShardMsg::ClockReset(rx)).await;
     }
     // seen/lost/heartbeat/rate_report/input_*: no state needed yet.
 }

@@ -17,21 +17,17 @@
 //! - One output task owns the CSV writers and the fan-out channel; shards
 //!   send it finished rows. Writers never contend with solving.
 
-use crate::state::{Published, ReceiverInfo, State};
+use crate::state::{Published, ReceiverInfo, RxRef, State};
 use mb_core::Icao;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
 pub enum ShardMsg {
-    AddReceiver(ReceiverInfo, oneshot::Sender<(usize, u32)>),
-    RemoveReceiver {
-        rx: usize,
-        gen: u32,
-    },
+    AddReceiver(ReceiverInfo, oneshot::Sender<RxRef>),
+    RemoveReceiver(RxRef),
     Sync {
-        rx: usize,
-        gen: u32,
+        rx: RxRef,
         et: f64,
         ot: f64,
         em: String,
@@ -42,16 +38,12 @@ pub enum ShardMsg {
         at_scaled: f64,
     },
     Mlat {
-        rx: usize,
-        gen: u32,
+        rx: RxRef,
         t: f64,
         m: String,
         at_scaled: f64,
     },
-    ClockReset {
-        rx: usize,
-        gen: u32,
-    },
+    ClockReset(RxRef),
     Stats(oneshot::Sender<(usize, u64, u64, u64)>),
     SyncJson(oneshot::Sender<serde_json::Value>),
 }
@@ -189,14 +181,12 @@ pub async fn run_shard(
                     ShardMsg::AddReceiver(info, reply) => {
                         let _ = reply.send(state.add_receiver(info));
                     }
-                    ShardMsg::RemoveReceiver { rx, gen } => state.remove_receiver(rx, gen),
-                    ShardMsg::Sync { rx, gen, et, ot, em, om, at_scaled } => {
-                        state.on_sync(rx, gen, et, ot, &em, &om, at_scaled)
+                    ShardMsg::RemoveReceiver(rx) => state.remove_receiver(rx),
+                    ShardMsg::Sync { rx, et, ot, em, om, at_scaled } => {
+                        state.on_sync(rx, et, ot, &em, &om, at_scaled)
                     }
-                    ShardMsg::Mlat { rx, gen, t, m, at_scaled } => {
-                        state.on_mlat(rx, gen, t, &m, at_scaled)
-                    }
-                    ShardMsg::ClockReset { rx, gen } => state.clock_reset(rx, gen),
+                    ShardMsg::Mlat { rx, t, m, at_scaled } => state.on_mlat(rx, t, &m, at_scaled),
+                    ShardMsg::ClockReset(rx) => state.clock_reset(rx),
                     ShardMsg::Stats(reply) => {
                         let _ = reply.send((
                             state.live_receivers(),
