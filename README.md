@@ -62,7 +62,8 @@ receives receiver coordinates. Bind the port to a private interface.
 
 ## Compatibility
 
-These functions are tested against the real mlat-client, end to end:
+These functions are tested against real mlat-client releases from
+0.2.13 (the original) to 0.4.2 (the maintained fork), end to end:
 the JSON handshake with `compress` none, zlib, and zlib2; selective
 traffic; sync and mlat messages for all documented clock types; result
 return; SBS output; `sync.json`; the mlat-server flag aliases.
