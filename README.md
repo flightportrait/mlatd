@@ -24,7 +24,10 @@ for each pair has a constant size. A gate rejects bad synchronization
 data. After repeated rejections, the server resets the pair. This
 corrects clock jumps. The solver does Gauss-Newton iteration on
 (lat, lon, t). The error estimate comes from the solution covariance.
-Each cluster of receivers elects its own reference receiver.
+Each cluster of receivers elects its own reference receiver. The
+partition adapts to density (crowded cells subdivide, with a 2° floor),
+and each fix is published by exactly the shard that owns the solved
+position.
 
 ## Run
 
@@ -53,7 +56,7 @@ receives receiver coordinates. Bind the port to a private interface.
 | `--write-csv` | off | results CSV, mlat-server column format |
 | `--self-truth-csv` | off | also multilaterates ADS-B frames and scores each fix against the position the aircraft transmitted |
 | `--shards` | auto (cores−2) | number of geographic shards in the process |
-| `--shard-cell-deg` / `--shard-cap` | 5.0 / 64 | partition cell size and receiver capacity for each shard |
+| `--shard-cell-deg` / `--shard-cap` | 5.0 / 64 | base partition cell size and shard receiver capacity; dense cells subdivide on their own — overrides, not tuning knobs |
 | `--write-filtered-csv` | off | alpha-beta-smoothed results (experimental) |
 | `--time-scale` / `--group-window-ms` | 1 / 900 | bench-replay support; do not change in production |
 
@@ -75,8 +78,6 @@ To migrate from mlat-server, read [docs/MIGRATION.md](docs/MIGRATION.md).
 
 ## Roadmap
 
-- Adaptive partition: density-split cells and rate-weighted shard
-  capacity, so the two `--shard-*` dials become unnecessary.
 - On request: UDP transport, the filtered-basestation listener,
   `--status-interval`.
 

@@ -85,6 +85,9 @@ pub struct Published {
 }
 
 pub struct State {
+    /// This shard's index, carried on every emitted fix for the output
+    /// task's territory gate.
+    shard_id: usize,
     /// Where finished rows go (the output task owns all writers and fan-out;
     /// shards never touch files). Lossy try_send: the solver never blocks.
     out: Option<tokio::sync::mpsc::Sender<crate::shard::OutMsg>>,
@@ -134,12 +137,14 @@ pub struct State {
 
 impl State {
     pub fn new(
+        shard_id: usize,
         time_scale: f64,
         mlat_adsb: bool,
         emit_filtered: bool,
         epoch: (f64, Instant),
     ) -> Self {
         State {
+            shard_id,
             out: None,
             adsb_pos: HashMap::new(),
             stamp_offset: HashMap::new(),
@@ -828,6 +833,9 @@ impl State {
                     obs.len()
                 );
                 self.emit(crate::shard::OutMsg::Fix(crate::shard::OutRow {
+                    shard: self.shard_id,
+                    lat: sol.pos.lat_deg,
+                    lon: sol.pos.lon_deg,
                     icao,
                     stamp,
                     csv_line: row,
@@ -948,7 +956,7 @@ mod tests {
     }
 
     fn state() -> State {
-        State::new(1.0, false, false, (0.0, Instant::now()))
+        State::new(0, 1.0, false, false, (0.0, Instant::now()))
     }
 
     #[test]

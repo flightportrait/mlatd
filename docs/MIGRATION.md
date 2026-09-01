@@ -15,7 +15,7 @@ selective traffic. The migration is a server-side swap.
 | `--filtered-basestation-listen` | not available | The SBS listener sends unsmoothed fixes. |
 | `--status-interval N` | not available | A periodic statistics line goes to stdout. |
 | (Kalman result columns) | `--write-filtered-csv` | Alpha-beta smoothing, experimental, off by default. |
-| — | `--shards`, `--shard-cell-deg`, `--shard-cap` | Internal geographic partition. The defaults are for a continental network. This replaces manual partitioning across multiple instances. |
+| — | `--shards`, `--shard-cell-deg`, `--shard-cap` | Internal geographic partition; it adapts to feeder density on its own. This replaces manual partitioning across multiple instances. The flags are overrides. |
 | — | `--self-truth-csv` | Live accuracy measurement: mlatd also multilaterates ADS-B aircraft and compares each fix with the transmitted position. |
 
 ## Operational differences

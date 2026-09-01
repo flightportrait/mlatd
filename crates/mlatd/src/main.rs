@@ -62,11 +62,13 @@ struct Cli {
     /// an independent geographic slice; see shard.rs.
     #[arg(long, default_value_t = 0)]
     shards: usize,
-    /// Geographic cell size for shard assignment, degrees. 5 suits sparse
-    /// continental networks; 2 suits dense metros under heavy load.
+    /// Base geographic cell size for shard assignment, degrees. Dense
+    /// cells split automatically, stopping at the 2° physical floor; the
+    /// flag is an override, not something a deployment should need.
     #[arg(long, default_value_t = 5.0)]
     shard_cell_deg: f64,
-    /// Receiver capacity per shard before region growth spills over.
+    /// Receiver capacity per shard before region growth spills over
+    /// (message rate gates growth too).
     #[arg(long, default_value_t = 64)]
     shard_cap: usize,
     /// Alpha-beta-smoothed results, same CSV format: the analogue of
@@ -112,11 +114,35 @@ async fn main() -> Result<()> {
         .map(|d| d.as_secs_f64())
         .unwrap_or(0.0);
 
-    // ---- output task: owns every writer, dedupes boundary aircraft -------
+    // ---- shards ----------------------------------------------------------
     let (out_tx, mut out_rx) = mpsc::channel::<OutMsg>(4096);
     let (publish, _) = tokio::sync::broadcast::channel::<Arc<Published>>(1024);
+    let window = Duration::from_millis(cli.group_window_ms);
+    let mut handles = Vec::new();
+    for shard_id in 0..n_shards {
+        let (tx, rx) = mpsc::channel::<ShardMsg>(8192);
+        let state = State::new(
+            shard_id,
+            cli.time_scale,
+            mlat_adsb,
+            cli.write_filtered_csv.is_some(),
+            (epoch_unix, epoch_real),
+        );
+        tokio::spawn(shard::run_shard(state, rx, out_tx.clone(), window));
+        handles.push(Arc::new(ShardHandle {
+            tx,
+            receivers: std::sync::atomic::AtomicUsize::new(0),
+            rate: std::sync::atomic::AtomicU64::new(0),
+        }));
+    }
+    let router = Arc::new(Router::new(handles, cli.shard_cell_deg, cli.shard_cap));
+    println!("mlatd: {n_shards} shards");
+    // ---- output task: owns every writer, dedupes boundary aircraft.
+    // (Channels first; the task itself spawns after the router exists,
+    // because the territory gate needs it.)
     {
         use std::io::Write;
+        let gate_router = router.clone();
         let publish = publish.clone();
         let mut csv = match &cli.write_csv {
             Some(p) => Some(std::io::BufWriter::new(std::fs::File::create(p)?)),
@@ -144,6 +170,16 @@ async fn main() -> Result<()> {
                         }
                     }
                     OutMsg::Fix(row) => {
+                        // Territory gate: only the shard owning the solved
+                        // position publishes. A border aircraft solved by a
+                        // neighbor shard's one-sided receiver subset carries
+                        // a systematic bias (measured ~200 m); the owner's
+                        // solve is the balanced one.
+                        if let Some(owner) = gate_router.owner_of_point(row.lat, row.lon) {
+                            if owner != row.shard {
+                                continue;
+                            }
+                        }
                         let key = (row.icao.0, (row.stamp * 10.0) as i64);
                         if recent.contains_key(&key) {
                             continue; // boundary twin
@@ -170,38 +206,26 @@ async fn main() -> Result<()> {
         });
     }
 
-    // ---- shards ----------------------------------------------------------
-    let window = Duration::from_millis(cli.group_window_ms);
-    let mut handles = Vec::new();
-    for _ in 0..n_shards {
-        let (tx, rx) = mpsc::channel::<ShardMsg>(8192);
-        let state = State::new(
-            cli.time_scale,
-            mlat_adsb,
-            cli.write_filtered_csv.is_some(),
-            (epoch_unix, epoch_real),
-        );
-        tokio::spawn(shard::run_shard(state, rx, out_tx.clone(), window));
-        handles.push(Arc::new(ShardHandle {
-            tx,
-            receivers: std::sync::atomic::AtomicUsize::new(0),
-        }));
-    }
-    let router = Arc::new(Router::new(handles, cli.shard_cell_deg, cli.shard_cap));
-    println!("mlatd: {n_shards} shards");
-
     // Stats line every 10 s, aggregated across shards.
     {
         let router = router.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(10));
+            let mut prev_sync: Vec<u64> = vec![0; router.all().len()];
             loop {
                 tick.tick().await;
                 let (mut rx_n, mut sync_o, mut solved, mut rej) = (0usize, 0u64, 0u64, 0u64);
-                for sh in router.all() {
+                for (i, sh) in router.all().iter().enumerate() {
                     let (otx, orx) = oneshot::channel();
                     if sh.tx.send(ShardMsg::Stats(otx)).await.is_ok() {
                         if let Ok((a, b, c, d)) = orx.await {
+                            // Per-window rate feeds the partition's
+                            // capacity gate.
+                            sh.rate.store(
+                                b.saturating_sub(prev_sync[i]),
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                            prev_sync[i] = b;
                             rx_n += a;
                             sync_o += b;
                             solved += c;
@@ -210,6 +234,11 @@ async fn main() -> Result<()> {
                     }
                 }
                 println!("mlatd: rx={rx_n} sync_obs={sync_o} solved={solved} rejected={rej}");
+                if std::env::var("MB_DEBUG_PARTITION").is_ok() {
+                    for (lvl, y, x, sh, n) in router.partition_dump() {
+                        println!("cell L{lvl} y{y} x{x} -> shard {sh} ({n} rx)");
+                    }
+                }
             }
         });
     }
