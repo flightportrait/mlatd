@@ -51,7 +51,7 @@ or more feeders with overlapping coverage produce positions.
 
 ## 4. The rigorous comparison, when you want it
 
-mlat-bench, our replay harness (publication pending), replays identical
+[mlat-bench](https://github.com/yoanntlm/mlat-bench) replays identical
 traffic to two servers and scores both. Its `record` subcommand is a
 transparent proxy: feeders connect to it, it forwards to your existing
 mlat-server unchanged and writes a capture. `replay` then feeds that
