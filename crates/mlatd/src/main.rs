@@ -444,7 +444,7 @@ async fn handle_client(
         "{{\"compress\":\"{negotiated}\",\"reconnect_in\":300,\"selective_traffic\":true,\
          \"heartbeat\":true,\"return_results\":{wants_results},\"rate_reports\":true,\
          \"return_stats\":{wants_stats},\
-         \"motd\":\"mlat-bench candidate mlatd\"}}\n"
+         \"motd\":\"FlightPortrait network MLAT (mlatd)\"}}\n"
     );
     wr.write_all(reply.as_bytes()).await?;
     println!("mlatd: {user} connected ({clock_type}, {negotiated})");
