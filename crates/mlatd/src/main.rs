@@ -258,8 +258,21 @@ async fn main() -> Result<()> {
                 };
                 let mut rx = publish.subscribe();
                 tokio::spawn(async move {
-                    while let Ok(p) = rx.recv().await {
-                        if sock.write_all(p.sbs_line.as_bytes()).await.is_err() {
+                    // readsb drops an SBS input that stays silent for 70 s;
+                    // a bare newline keeps it up through quiet periods and
+                    // its parser ignores lines that do not start with MSG.
+                    let mut keepalive = tokio::time::interval(Duration::from_secs(30));
+                    keepalive.tick().await;
+                    loop {
+                        let bytes: Vec<u8> = tokio::select! {
+                            r = rx.recv() => match r {
+                                Ok(p) => p.sbs_line.as_bytes().to_vec(),
+                                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                                Err(_) => break,
+                            },
+                            _ = keepalive.tick() => b"\n".to_vec(),
+                        };
+                        if sock.write_all(&bytes).await.is_err() {
                             break;
                         }
                     }
