@@ -1,0 +1,22 @@
+# mlatd as a systemd service. Copy to /etc/systemd/system/mlatd.service,
+# put the binary at /usr/local/bin/mlatd, then:
+#   systemctl daemon-reload && systemctl enable --now mlatd
+[Unit]
+Description=mlatd MLAT server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+DynamicUser=yes
+StateDirectory=mlatd
+ExecStart=/usr/local/bin/mlatd \
+  --client-listen 0.0.0.0:41113 \
+  --basestation-listen 127.0.0.1:32007 \
+  --work-dir /var/lib/mlatd
+Restart=always
+RestartSec=5
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

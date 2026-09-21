@@ -1,0 +1,50 @@
+name: release
+
+# Static Linux binaries on every release, for operators who run mlatd as
+# a plain systemd service. Also runnable by hand for an existing tag.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: existing release tag to attach binaries to
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  binaries:
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: cargo build --release -p mlatd --target ${{ matrix.target }}
+      - name: package
+        run: |
+          set -e
+          TAG="${{ github.event.inputs.tag || github.event.release.tag_name }}"
+          NAME="mlatd-${TAG}-${{ matrix.target }}"
+          mkdir "$NAME"
+          cp "target/${{ matrix.target }}/release/mlatd" "$NAME/"
+          cp README.md LICENSE-AGPL mlatd.service.example "$NAME/"
+          tar czf "$NAME.tar.gz" "$NAME"
+          sha256sum "$NAME.tar.gz" > "$NAME.tar.gz.sha256"
+          echo "ASSET=$NAME.tar.gz" >> "$GITHUB_ENV"
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+      - run: gh release upload "$TAG" "$ASSET" "$ASSET.sha256" --clobber
+        env:
+          GH_TOKEN: ${{ github.token }}

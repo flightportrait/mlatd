@@ -31,6 +31,14 @@ position.
 
 ## Run
 
+Without Docker: download the static Linux binary for your CPU from the
+[latest release](https://github.com/flightportrait/mlatd/releases)
+(x86_64 or aarch64), put it at `/usr/local/bin/mlatd`, and use
+`mlatd.service.example` as the systemd unit. Or build from source with
+`cargo build --release -p mlatd` (the binary lands in `target/release/`).
+
+With Docker:
+
 ```sh
 docker build -t mlatd .
 docker run --rm -p 31090:31090 mlatd \
