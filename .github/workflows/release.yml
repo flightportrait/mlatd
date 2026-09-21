@@ -39,7 +39,9 @@ jobs:
           NAME="mlatd-${TAG}-${{ matrix.target }}"
           mkdir "$NAME"
           cp "target/${{ matrix.target }}/release/mlatd" "$NAME/"
-          cp README.md LICENSE-AGPL mlatd.service.example "$NAME/"
+          for f in README.md LICENSE-AGPL mlatd.service.example; do
+            [ -f "$f" ] && cp "$f" "$NAME/"   # a tag may predate a file
+          done
           tar czf "$NAME.tar.gz" "$NAME"
           sha256sum "$NAME.tar.gz" > "$NAME.tar.gz.sha256"
           echo "ASSET=$NAME.tar.gz" >> "$GITHUB_ENV"
