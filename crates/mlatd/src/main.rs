@@ -54,6 +54,11 @@ struct Cli {
     /// 127.0.0.1:40161. mlat-server's flag name, kept for compatibility.
     #[arg(long)]
     basestation_listen: Option<String>,
+    /// SBS/BaseStation output as a client: connect to host:port (a readsb
+    /// --net-sbs-in-port, or any SBS listener) and push results, with
+    /// reconnect. mlat-server's flag name; may repeat.
+    #[arg(long)]
+    basestation_connect: Vec<String>,
     /// Work dir: sync.json is written here every 15 s in mlat-server's
     /// format, so existing monitoring keeps working.
     #[arg(long)]
@@ -253,30 +258,36 @@ async fn main() -> Result<()> {
             };
             println!("mlatd: SBS output on {addr}");
             loop {
-                let Ok((mut sock, _)) = l.accept().await else {
+                let Ok((sock, _)) = l.accept().await else {
                     break;
                 };
-                let mut rx = publish.subscribe();
-                tokio::spawn(async move {
-                    // readsb drops an SBS input that stays silent for 70 s;
-                    // a bare newline keeps it up through quiet periods and
-                    // its parser ignores lines that do not start with MSG.
-                    let mut keepalive = tokio::time::interval(Duration::from_secs(30));
-                    keepalive.tick().await;
-                    loop {
-                        let bytes: Vec<u8> = tokio::select! {
-                            r = rx.recv() => match r {
-                                Ok(p) => p.sbs_line.as_bytes().to_vec(),
-                                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                                Err(_) => break,
-                            },
-                            _ = keepalive.tick() => b"\n".to_vec(),
-                        };
-                        if sock.write_all(&bytes).await.is_err() {
-                            break;
+                let rx = publish.subscribe();
+                tokio::spawn(sbs_writer(sock, rx));
+            }
+        });
+    }
+    // SBS output as a client (mlat-server's --basestation-connect): dial
+    // the consumer, push the same stream, redial after any failure.
+    for addr in cli.basestation_connect.clone() {
+        let publish = publish.clone();
+        tokio::spawn(async move {
+            let mut announced = false;
+            loop {
+                match TcpStream::connect(&addr).await {
+                    Ok(sock) => {
+                        println!("mlatd: SBS output connected to {addr}");
+                        announced = false;
+                        sbs_writer(sock, publish.subscribe()).await;
+                        eprintln!("mlatd: SBS output to {addr} closed; reconnecting");
+                    }
+                    Err(e) => {
+                        if !announced {
+                            eprintln!("mlatd: SBS output to {addr} unavailable ({e}); retrying");
+                            announced = true;
                         }
                     }
-                });
+                }
+                tokio::time::sleep(Duration::from_secs(5)).await;
             }
         });
     }
@@ -723,4 +734,26 @@ async fn process_line_tx(
         let _ = shard.tx.send(ShardMsg::ClockReset(rx)).await;
     }
     // seen/lost/heartbeat/rate_report/input_*: no state needed yet.
+}
+
+/// Write the broadcast fix stream to one SBS consumer until it goes away.
+/// readsb drops an SBS input that stays silent for 70 s; a bare newline
+/// every 30 s keeps it up through quiet periods and its parser ignores
+/// lines that do not start with MSG.
+async fn sbs_writer(mut sock: TcpStream, mut rx: tokio::sync::broadcast::Receiver<Arc<Published>>) {
+    let mut keepalive = tokio::time::interval(Duration::from_secs(30));
+    keepalive.tick().await;
+    loop {
+        let bytes: Vec<u8> = tokio::select! {
+            r = rx.recv() => match r {
+                Ok(p) => p.sbs_line.as_bytes().to_vec(),
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(_) => break,
+            },
+            _ = keepalive.tick() => b"\n".to_vec(),
+        };
+        if sock.write_all(&bytes).await.is_err() {
+            break;
+        }
+    }
 }

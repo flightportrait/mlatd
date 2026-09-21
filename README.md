@@ -43,6 +43,11 @@ Add this line to the feeder configuration (readsb or ultrafeeder):
 mlat,<host>,31090,uuid=<station-uuid>
 ```
 
+Results reach readsb either way: readsb pulls from the SBS port
+(`--net-connector=<mlatd-host>,31003,sbs_in_mlat`, which tags the
+positions as MLAT), or mlatd pushes to readsb with
+`--basestation-connect <readsb-host>:<port>`, as mlat-server does.
+
 Use `compose.example.yml` to run mlatd as a service. The client port
 receives receiver coordinates. Bind the port to a private interface.
 
@@ -51,7 +56,8 @@ receives receiver coordinates. Bind the port to a private interface.
 | flag | default | |
 |---|---|---|
 | `--client-listen` | — | mlat-client port; `[host:]port`; a bare port binds 0.0.0.0 |
-| `--basestation-listen` | off | SBS/BaseStation output |
+| `--basestation-listen` | off | SBS/BaseStation output; readsb pulls it with `--net-connector=<host>,<port>,sbs_in_mlat` |
+| `--basestation-connect` | off | SBS/BaseStation output pushed to a `host:port` (a readsb `--net-sbs-in-port`), with reconnect; may repeat |
 | `--work-dir` | off | writes `sync.json` (mlat-server format) and `partition.json` (the shard map as data) every 15 s |
 | `--write-csv` | off | results CSV, mlat-server column format |
 | `--self-truth-csv` | off | also multilaterates ADS-B frames and scores each fix against the position the aircraft transmitted |

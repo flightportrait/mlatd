@@ -11,8 +11,9 @@ selective traffic. The migration is a server-side swap.
 | `--client-listen [host:]tcp[:udp]` | `--client-listen [host:]tcp` | TCP only. Remove a UDP port suffix. |
 | `--work-dir DIR` | `--work-dir DIR` | mlatd writes only `sync.json` there (same format, every 15 s). There is no other state to migrate. |
 | `--write-csv FILE` | `--write-csv FILE` | Same column format. Optional in mlatd. |
-| `--basestation-listen [host:]port` | `--basestation-listen [host:]port` | Same SBS output. |
-| `--filtered-basestation-listen` | not available | The SBS listener sends unsmoothed fixes. |
+| `--basestation-listen [host:]port` | `--basestation-listen [host:]port` | Same SBS output; readsb pulls it with `--net-connector=<host>,<port>,sbs_in_mlat`. |
+| `--basestation-connect host:port` | `--basestation-connect host:port` | Same: mlatd dials readsb (`--net-sbs-in-port`) and pushes results, reconnecting every 5 s. May repeat. |
+| `--filtered-basestation-listen` / `--filtered-basestation-connect` | not available | The SBS outputs send unsmoothed fixes. Point the filtered consumer at the unfiltered flag. |
 | `--status-interval N` | not available | A periodic statistics line goes to stdout. |
 | (Kalman result columns) | `--write-filtered-csv` | Alpha-beta smoothing, experimental, off by default. |
 | — | `--shards`, `--shard-cell-deg`, `--shard-cap` | Internal geographic partition; it adapts to feeder density on its own. This replaces manual partitioning across multiple instances. The flags are overrides. |

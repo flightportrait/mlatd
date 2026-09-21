@@ -258,7 +258,7 @@ dependencies = [
 
 [[package]]
 name = "mb-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "rand",
  "rand_chacha",
@@ -268,7 +268,7 @@ dependencies = [
 
 [[package]]
 name = "mb-modes"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "hex",
  "mb-core",
@@ -276,7 +276,7 @@ dependencies = [
 
 [[package]]
 name = "mb-proto"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "flate2",
  "hex",
@@ -315,7 +315,7 @@ dependencies = [
 
 [[package]]
 name = "mlatd"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",

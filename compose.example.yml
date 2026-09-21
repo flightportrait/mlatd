@@ -15,6 +15,7 @@ services:
     command:
       - --client-listen=0.0.0.0:31090
       - --basestation-listen=0.0.0.0:31003
+      # or push to a readsb --net-sbs-in-port instead: --basestation-connect=<readsb-host>:<port>
       - --work-dir=/work
     ports:
       - "${MLATD_BIND:-127.0.0.1}:31090:31090"   # mlat-client port

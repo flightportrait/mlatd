@@ -40,7 +40,8 @@ or more feeders with overlapping coverage produce positions.
 - `work/sync.json`: mlat-server's format; existing sync dashboards read
   it unchanged.
 - The SBS port (31003): feed it to a readsb instance the same way you
-  ingest mlat-server results.
+  ingest mlat-server results (`--net-connector=<host>,31003,sbs_in_mlat`),
+  or have mlatd push with `--basestation-connect` instead.
 - `work/selftruth.csv`: mlatd also multilaterates ADS-B aircraft and
   compares each fix with the position the aircraft transmitted. This is
   live accuracy measurement without ground truth
@@ -61,6 +62,6 @@ run `fuzz` on it: receiver coordinates identify homes.
 
 ## Known gaps
 
-UDP transport, the filtered-basestation listener, and `--status-interval`
+UDP transport, the filtered-basestation outputs, and `--status-interval`
 are not implemented; results return to clients in the "old" format only.
 If the trial needs one of these, say so.
