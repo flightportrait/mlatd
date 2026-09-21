@@ -16,6 +16,8 @@ deployment yet.
 
 ## Design
 
+The server asks each receiver for every aircraft it offers (mlat-server
+caps sync at 15 ADS-B aircraft per receiver; mlatd can, off by default).
 The server puts each receiver in a geographic shard. Each shard is one
 task. A shard owns its receivers, its clock pairs, and its aircraft.
 Shards do not share memory. Clock synchronization is an online
@@ -70,8 +72,9 @@ receives receiver coordinates. Bind the port to a private interface.
 | `--status-interval` | 15 | seconds between statistics lines on stdout; -1 disables |
 | `--write-csv` | off | results CSV, mlat-server column format |
 | `--self-truth-csv` | off | also multilaterates ADS-B frames and scores each fix against the position the aircraft transmitted |
-| `--shards` | auto (cores−2) | number of geographic shards in the process |
-| `--shard-cell-deg` / `--shard-cap` | 5.0 / 64 | base partition cell size and shard receiver capacity; dense cells subdivide on their own — overrides, not tuning knobs |
+| `--shards` | auto (one per core) | number of geographic shards in the process; the scaling lever |
+| `--shard-cell-deg` / `--shard-cap` | 2.0 / 64 | base partition cell size and shard receiver capacity; dense cells subdivide on their own — overrides, not tuning knobs |
+| `--sync-aircraft-per-receiver` | 0 (unlimited) | ADS-B aircraft a receiver keeps sending sync pairs for (mlat-server caps at 15); Mode-S targets are never capped; a relief valve for a saturated uplink |
 | `--write-filtered-csv` | off | alpha-beta-smoothed results (experimental) |
 | `--time-scale` / `--group-window-ms` | 1 / 900 | bench-replay support; do not change in production |
 

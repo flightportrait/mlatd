@@ -16,6 +16,7 @@ mod shard;
 mod solve;
 mod state;
 mod track;
+mod traffic;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -68,14 +69,18 @@ struct Cli {
     /// mlat-server's flag; rounded up to the 10 s stats cadence.
     #[arg(long, default_value_t = 15, allow_hyphen_values = true)]
     status_interval: i64,
-    /// Shard count (0 = auto: available cores − 2, min 1). Each shard owns
-    /// an independent geographic slice; see shard.rs.
+    /// Shard count (0 = auto: one per available core). Each shard owns an
+    /// independent geographic slice; see shard.rs. Shards are the scaling
+    /// lever: on the 2026-09-21 drill (500 receivers, one country) 2 cores
+    /// gave 0.3 % coverage with one shard and 7.9 % with two; 4 cores and
+    /// four shards 25 %; mlat-server on the same traffic 0 %.
     #[arg(long, default_value_t = 0)]
     shards: usize,
-    /// Base geographic cell size for shard assignment, degrees. Dense
-    /// cells split automatically, stopping at the 2° physical floor; the
-    /// flag is an override, not something a deployment should need.
-    #[arg(long, default_value_t = 5.0)]
+    /// Base geographic cell size for shard assignment, degrees. 2° is the
+    /// co-hearing floor and the default: coarser cells let one shard claim
+    /// a whole country in the first second of a connect burst (5° cells on
+    /// the 2026-09-21 drill: 2 of 4 shards used). An override, not a knob.
+    #[arg(long, default_value_t = 2.0)]
     shard_cell_deg: f64,
     /// Receiver capacity per shard before region growth spills over
     /// (message rate gates growth too).
@@ -91,6 +96,13 @@ struct Cli {
     /// truth. Rows: t,icao,err_m,est_m,n → this CSV.
     #[arg(long)]
     self_truth_csv: Option<std::path::PathBuf>,
+    /// ADS-B aircraft a receiver keeps sending sync pairs for, at most
+    /// (mlat-server's MAX_SYNC_AC = 15). Mode-S targets are never capped.
+    /// 0 = unlimited, the default: on the 2026-09-21 drill a cap of 15
+    /// cut sync intake 8× but cost 3 points of coverage and freed no CPU,
+    /// so it is a relief valve for a saturated uplink, not a default.
+    #[arg(long, default_value_t = 0)]
+    sync_aircraft_per_receiver: usize,
 }
 
 #[tokio::main]
@@ -99,7 +111,7 @@ async fn main() -> Result<()> {
     let mlat_adsb = cli.self_truth_csv.is_some();
     let n_shards = if cli.shards == 0 {
         std::thread::available_parallelism()
-            .map(|n| (n.get().saturating_sub(2)).max(1))
+            .map(|n| n.get().max(1))
             .unwrap_or(1)
     } else {
         cli.shards
@@ -392,18 +404,16 @@ async fn main() -> Result<()> {
         let publish = publish.clone();
         let scale = cli.time_scale;
         let uid = uid_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let sync_cap = cli.sync_aircraft_per_receiver;
         tokio::spawn(async move {
-            if let Err(e) = handle_client(
-                stream,
-                router,
-                publish,
+            let cfg = ClientCfg {
                 hb_real,
-                scale,
-                (epoch_unix, epoch_real),
+                time_scale: scale,
+                epoch: (epoch_unix, epoch_real),
                 uid,
-            )
-            .await
-            {
+                sync_cap,
+            };
+            if let Err(e) = handle_client(stream, router, publish, cfg).await {
                 eprintln!("mlatd: {peer}: {e:#}");
             }
         });
@@ -425,15 +435,30 @@ fn scaled_now(t0_unix: f64, t0: std::time::Instant, scale: f64) -> f64 {
     t0_unix + t0.elapsed().as_secs_f64() * scale
 }
 
+/// Per-connection settings handed to handle_client.
+struct ClientCfg {
+    hb_real: Duration,
+    time_scale: f64,
+    epoch: (f64, std::time::Instant),
+    /// Process-wide serial (mlat-server's uid).
+    uid: u64,
+    /// ADS-B sync aircraft cap per receiver; 0 = unlimited.
+    sync_cap: usize,
+}
+
 async fn handle_client(
     stream: TcpStream,
     router: Arc<Router>,
     publish: tokio::sync::broadcast::Sender<Arc<Published>>,
-    hb_real: Duration,
-    time_scale: f64,
-    epoch: (f64, std::time::Instant),
-    uid: u64,
+    cfg: ClientCfg,
 ) -> Result<()> {
+    let ClientCfg {
+        hb_real,
+        time_scale,
+        epoch,
+        uid,
+        sync_cap,
+    } = cfg;
     let (conn_t0_unix, conn_t0) = epoch;
     stream.set_nodelay(true)?;
     let (source_ip, source_port) = match stream.peer_addr() {
@@ -626,7 +651,7 @@ async fn handle_client(
     } else {
         Some(ZlibFrameDecoder::new())
     };
-    let mut requested: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut traffic = traffic::Traffic::new(sync_cap);
     let res: Result<()> = async {
         loop {
             match &mut zdec {
@@ -648,7 +673,7 @@ async fn handle_client(
                                 anyhow::bail!("line over 256 KiB");
                             }
                             let now_s = scaled_now(conn_t0_unix, conn_t0, time_scale);
-                            process_line_tx(&shard, rx, &line, Some(&tx_line), &mut requested, now_s).await;
+                            process_line_tx(&shard, rx, &line, Some(&tx_line), &mut traffic, now_s).await;
                         }
                     }
                 }
@@ -683,7 +708,7 @@ async fn handle_client(
                     let now_s = scaled_now(conn_t0_unix, conn_t0, time_scale);
                     for line in chunk.split(|b| *b == b'\n') {
                         if !line.is_empty() {
-                            process_line_tx(&shard, rx, line, Some(&tx_line), &mut requested, now_s)
+                            process_line_tx(&shard, rx, line, Some(&tx_line), &mut traffic, now_s)
                                 .await;
                         }
                     }
@@ -731,13 +756,15 @@ async fn push_stats(
 }
 
 /// seen/rate_report trigger start_sending for aircraft not yet requested on
-/// this connection; a real mlat-client sends nothing until asked.
+/// this connection; a real mlat-client sends nothing until asked. Sync
+/// pairs beyond the per-receiver ADS-B cap turn into stop_sending
+/// (traffic.rs).
 async fn process_line_tx(
     shard: &Arc<ShardHandle>,
     rx: crate::state::RxRef,
     line: &[u8],
     tx: Option<&tokio::sync::mpsc::Sender<String>>,
-    requested: &mut std::collections::HashSet<String>,
+    traffic: &mut traffic::Traffic,
     at_scaled: f64,
 ) {
     let Ok(v) = serde_json::from_slice::<serde_json::Value>(line) else {
@@ -750,16 +777,18 @@ async fn process_line_tx(
         if let Some(seen) = v.get("seen").and_then(|x| x.as_array()) {
             for a in seen {
                 if let Some(h) = a.as_str() {
-                    if requested.insert(h.to_lowercase()) {
-                        fresh.push(h.to_lowercase());
+                    let h = h.to_lowercase();
+                    if traffic.offered(&h, at_scaled) {
+                        fresh.push(h);
                     }
                 }
             }
         }
         if let Some(rr) = v.get("rate_report").and_then(|x| x.as_object()) {
             for k in rr.keys() {
-                if requested.insert(k.to_lowercase()) {
-                    fresh.push(k.to_lowercase());
+                let k = k.to_lowercase();
+                if traffic.offered(&k, at_scaled) {
+                    fresh.push(k);
                 }
             }
         }
@@ -769,6 +798,11 @@ async fn process_line_tx(
                 serde_json::to_string(&fresh).unwrap_or_default()
             );
             let _ = tx.try_send(msg);
+        }
+        if let Some(lost) = v.get("lost").and_then(|x| x.as_array()) {
+            for a in lost.iter().filter_map(|a| a.as_str()) {
+                traffic.lost(&a.to_lowercase());
+            }
         }
     }
     if let Some(sy) = v.get("sync") {
@@ -780,6 +814,16 @@ async fn process_line_tx(
         ) else {
             return;
         };
+        // The ADS-B cap: a sync pair from an aircraft beyond this
+        // receiver's quota is dropped and the client told to stop it.
+        if let Some(icao) = traffic::adsb_icao(em) {
+            if !traffic.on_sync(&icao, at_scaled) {
+                if let Some(tx) = tx {
+                    let _ = tx.try_send(format!("{{\"stop_sending\":[\"{icao}\"]}}\n"));
+                }
+                return;
+            }
+        }
         let _ = shard
             .tx
             .send(ShardMsg::Sync {
