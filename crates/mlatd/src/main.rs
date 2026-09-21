@@ -59,10 +59,15 @@ struct Cli {
     /// reconnect. mlat-server's flag name; may repeat.
     #[arg(long)]
     basestation_connect: Vec<String>,
-    /// Work dir: sync.json is written here every 15 s in mlat-server's
-    /// format, so existing monitoring keeps working.
+    /// Work dir: sync.json, clients.json and aircraft.json are written
+    /// here every 15 s in mlat-server's format, so existing monitoring
+    /// keeps working (plus partition.json, the shard map).
     #[arg(long)]
     work_dir: Option<std::path::PathBuf>,
+    /// Seconds between statistics lines on stdout; -1 disables them.
+    /// mlat-server's flag; rounded up to the 10 s stats cadence.
+    #[arg(long, default_value_t = 15, allow_hyphen_values = true)]
+    status_interval: i64,
     /// Shard count (0 = auto: available cores − 2, min 1). Each shard owns
     /// an independent geographic slice; see shard.rs.
     #[arg(long, default_value_t = 0)]
@@ -211,12 +216,15 @@ async fn main() -> Result<()> {
         });
     }
 
-    // Stats line every 10 s, aggregated across shards.
+    // Stats every 10 s, aggregated across shards: the partition's load
+    // gate reads them each time; the stdout line follows --status-interval.
     {
         let router = router.clone();
+        let status_every = cli.status_interval;
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(10));
             let mut prev_sync: Vec<u64> = vec![0; router.all().len()];
+            let mut last_status = std::time::Instant::now();
             loop {
                 tick.tick().await;
                 let (mut rx_n, mut sync_o, mut solved, mut rej) = (0usize, 0u64, 0u64, 0u64);
@@ -238,7 +246,12 @@ async fn main() -> Result<()> {
                         }
                     }
                 }
-                println!("mlatd: rx={rx_n} sync_obs={sync_o} solved={solved} rejected={rej}");
+                let due = status_every >= 0
+                    && last_status.elapsed().as_secs_f64() >= status_every as f64 * 0.95;
+                if due {
+                    last_status = std::time::Instant::now();
+                    println!("mlatd: rx={rx_n} sync_obs={sync_o} solved={solved} rejected={rej}");
+                }
                 if std::env::var("MB_DEBUG_PARTITION").is_ok() {
                     for (lvl, y, x, sh, n) in router.partition_dump() {
                         println!("cell L{lvl} y{y} x{x} -> shard {sh} ({n} rx)");
@@ -291,7 +304,8 @@ async fn main() -> Result<()> {
             }
         });
     }
-    // sync.json export for existing monitoring, merged across shards.
+    // Work-dir export for existing monitoring, merged across shards:
+    // sync.json, clients.json, aircraft.json in mlat-server's shapes.
     if let Some(dir) = cli.work_dir.clone() {
         let router = router.clone();
         let _ = std::fs::create_dir_all(&dir);
@@ -299,18 +313,46 @@ async fn main() -> Result<()> {
             let mut tick = tokio::time::interval(Duration::from_secs(15));
             loop {
                 tick.tick().await;
-                let mut merged = serde_json::Map::new();
+                let mut sync = serde_json::Map::new();
+                let mut clients = serde_json::Map::new();
+                let mut aircraft = serde_json::Map::new();
                 for sh in router.all() {
                     let (otx, orx) = oneshot::channel();
                     if sh.tx.send(ShardMsg::SyncJson(otx)).await.is_ok() {
                         if let Ok(serde_json::Value::Object(m)) = orx.await {
-                            merged.extend(m);
+                            sync.extend(m);
+                        }
+                    }
+                    let (otx, orx) = oneshot::channel();
+                    if sh.tx.send(ShardMsg::StateJson(otx)).await.is_ok() {
+                        if let Ok((serde_json::Value::Object(c), serde_json::Value::Object(a))) =
+                            orx.await
+                        {
+                            clients.extend(c);
+                            // A border aircraft is known to two shards; the
+                            // one that heard it last speaks for it.
+                            for (icao, entry) in a {
+                                let newer = aircraft
+                                    .get(&icao)
+                                    .and_then(|e| e["elapsed_seen"].as_f64())
+                                    .is_none_or(|prev| {
+                                        entry["elapsed_seen"].as_f64().unwrap_or(f64::MAX) < prev
+                                    });
+                                if newer {
+                                    aircraft.insert(icao, entry);
+                                }
+                            }
                         }
                     }
                 }
-                let _ = std::fs::write(
-                    dir.join("sync.json"),
-                    serde_json::to_vec(&serde_json::Value::Object(merged)).unwrap_or_default(),
+                write_atomic(&dir.join("sync.json"), &serde_json::Value::Object(sync));
+                write_atomic(
+                    &dir.join("clients.json"),
+                    &serde_json::Value::Object(clients),
+                );
+                write_atomic(
+                    &dir.join("aircraft.json"),
+                    &serde_json::Value::Object(aircraft),
                 );
                 // partition.json beside it: the cell map as data, for
                 // plots/partition.py. Cells carry no receiver positions.
@@ -330,14 +372,15 @@ async fn main() -> Result<()> {
                         })
                     })
                     .collect();
-                let _ = std::fs::write(
-                    dir.join("partition.json"),
-                    serde_json::to_vec(&serde_json::Value::Array(cells)).unwrap_or_default(),
+                write_atomic(
+                    &dir.join("partition.json"),
+                    &serde_json::Value::Array(cells),
                 );
             }
         });
     }
 
+    let uid_counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let listener = TcpListener::bind(&listen)
         .await
         .with_context(|| format!("bind {listen}"))?;
@@ -348,6 +391,7 @@ async fn main() -> Result<()> {
         let router = router.clone();
         let publish = publish.clone();
         let scale = cli.time_scale;
+        let uid = uid_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         tokio::spawn(async move {
             if let Err(e) = handle_client(
                 stream,
@@ -356,12 +400,23 @@ async fn main() -> Result<()> {
                 hb_real,
                 scale,
                 (epoch_unix, epoch_real),
+                uid,
             )
             .await
             {
                 eprintln!("mlatd: {peer}: {e:#}");
             }
         });
+    }
+}
+
+/// Write a JSON file the way mlat-server does: to a temp file, then an
+/// atomic rename, so a reader never sees a half-written document.
+fn write_atomic(path: &std::path::Path, value: &serde_json::Value) {
+    let tmp = path.with_extension("json.tmp");
+    let bytes = serde_json::to_vec(value).unwrap_or_default();
+    if std::fs::write(&tmp, bytes).is_ok() {
+        let _ = std::fs::rename(&tmp, path);
     }
 }
 
@@ -377,9 +432,14 @@ async fn handle_client(
     hb_real: Duration,
     time_scale: f64,
     epoch: (f64, std::time::Instant),
+    uid: u64,
 ) -> Result<()> {
     let (conn_t0_unix, conn_t0) = epoch;
     stream.set_nodelay(true)?;
+    let (source_ip, source_port) = match stream.peer_addr() {
+        Ok(a) => (a.ip().to_string(), a.port()),
+        Err(_) => (String::new(), 0),
+    };
     let (rd, mut wr) = stream.into_split();
     let mut rd = BufReader::new(rd);
 
@@ -436,6 +496,14 @@ async fn handle_client(
         alt_m: alt,
     };
     let gps = clock_type.starts_with("radarcape_gps");
+    let uuid = hs["uuid"].as_str().map(String::from);
+    let privacy = hs["privacy"].as_bool().unwrap_or(false);
+    // mlat-server's connection_info: "user v<proto> <clock> <client> tcp <compress>".
+    let connection_info = format!(
+        "{user} v{} {clock_type} {} tcp {negotiated}",
+        hs["version"].as_i64().unwrap_or(0),
+        hs["client_version"].as_str().unwrap_or("unknown"),
+    );
     // Route by geography: this receiver's shard owns it for the process
     // lifetime.
     // The router counts the receiver at claim time; teardown decrements.
@@ -446,6 +514,12 @@ async fn handle_client(
         .send(ShardMsg::AddReceiver(
             ReceiverInfo {
                 user: user.clone(),
+                uid,
+                uuid,
+                privacy,
+                connection_info,
+                source_ip,
+                source_port,
                 ecef: geo.to_ecef(),
                 geo,
                 freq_hz,

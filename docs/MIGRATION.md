@@ -9,12 +9,12 @@ selective traffic. The migration is a server-side swap.
 | mlat-server | mlatd | notes |
 |---|---|---|
 | `--client-listen [host:]tcp[:udp]` | `--client-listen [host:]tcp` | TCP only. Remove a UDP port suffix. |
-| `--work-dir DIR` | `--work-dir DIR` | mlatd writes only `sync.json` there (same format, every 15 s). There is no other state to migrate. |
+| `--work-dir DIR` | `--work-dir DIR` | `sync.json`, `clients.json`, `aircraft.json` in the same formats, every 15 s, written atomically; plus `partition.json`. There is no other state to migrate. |
 | `--write-csv FILE` | `--write-csv FILE` | Same column format. Optional in mlatd. |
 | `--basestation-listen [host:]port` | `--basestation-listen [host:]port` | Same SBS output; readsb pulls it with `--net-connector=<host>,<port>,sbs_in_mlat`. |
 | `--basestation-connect host:port` | `--basestation-connect host:port` | Same: mlatd dials readsb (`--net-sbs-in-port`) and pushes results, reconnecting every 5 s. May repeat. |
 | `--filtered-basestation-listen` / `--filtered-basestation-connect` | not available | The SBS outputs send unsmoothed fixes. Point the filtered consumer at the unfiltered flag. |
-| `--status-interval N` | not available | A periodic statistics line goes to stdout. |
+| `--status-interval N` | `--status-interval N` | Same: seconds between statistics lines, -1 disables. mlatd's line is `rx= sync_obs= solved= rejected=`. |
 | (Kalman result columns) | `--write-filtered-csv` | Alpha-beta smoothing, experimental, off by default. |
 | — | `--shards`, `--shard-cell-deg`, `--shard-cap` | Internal geographic partition; it adapts to feeder density on its own. This replaces manual partitioning across multiple instances. The flags are overrides. |
 | — | `--self-truth-csv` | Live accuracy measurement: mlatd also multilaterates ADS-B aircraft and compares each fix with the transmitted position. |
@@ -30,7 +30,17 @@ selective traffic. The migration is a server-side swap.
   downstream assumptions about the output rate.
 - `sync.json` continues to work for dashboards. The values come from
   mlatd's own clock models; the numbers differ from mlat-server's
-  numbers, with the same meaning.
+  numbers, with the same meaning. `bad_syncs` is 0 or 0.4: mlatd has one
+  verdict on a receiver, the timing-bias quarantine, and 0.4 is the score
+  behind the `bad_sync_timeout` of 60 s its stats push reports.
+- `clients.json` and `aircraft.json` carry mlat-server's fields. Two
+  differ in origin: `sync_interest` and `mlat_interest` list the aircraft
+  a receiver actually reported in the last minute, not the ones the
+  server asked it for (mlatd asks for everything). `mlat_kalman_count` is
+  always 0 and `heading`/`speed` come from the last two fixes, since there
+  is no Kalman track. The map position in `sync.json` is fudged as in
+  mlat-server (1/20° grid, hidden under `privacy`), with an offset derived
+  from the user name so it survives restarts.
 - The server finds clock jumps for each receiver pair and resets the
   pair. No manual intervention is necessary.
 - Reconnects are cheap. A feeder that reconnects takes its old slot

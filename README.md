@@ -58,7 +58,8 @@ receives receiver coordinates. Bind the port to a private interface.
 | `--client-listen` | — | mlat-client port; `[host:]port`; a bare port binds 0.0.0.0 |
 | `--basestation-listen` | off | SBS/BaseStation output; readsb pulls it with `--net-connector=<host>,<port>,sbs_in_mlat` |
 | `--basestation-connect` | off | SBS/BaseStation output pushed to a `host:port` (a readsb `--net-sbs-in-port`), with reconnect; may repeat |
-| `--work-dir` | off | writes `sync.json` (mlat-server format) and `partition.json` (the shard map as data) every 15 s |
+| `--work-dir` | off | writes `sync.json`, `clients.json`, `aircraft.json` (mlat-server formats) and `partition.json` (the shard map as data) every 15 s |
+| `--status-interval` | 15 | seconds between statistics lines on stdout; -1 disables |
 | `--write-csv` | off | results CSV, mlat-server column format |
 | `--self-truth-csv` | off | also multilaterates ADS-B frames and scores each fix against the position the aircraft transmitted |
 | `--shards` | auto (cores−2) | number of geographic shards in the process |
@@ -72,14 +73,14 @@ These functions are tested against real mlat-client releases from
 0.2.13 (the original) to 0.4.2 (the maintained fork), end to end:
 the JSON handshake with `compress` none, zlib, and zlib2; selective
 traffic; sync and mlat messages for all documented clock types; result
-return; SBS output; `sync.json`; the mlat-server flag aliases.
+return; SBS output; `sync.json`, `clients.json`, `aircraft.json`; the
+mlat-server flag aliases.
 
 The server also emits the per-receiver stats push (`return_stats`),
 which mlat-client turns into its `--stats-json` file.
 
 These functions are not implemented: UDP transport, the
-filtered-basestation listener, `--status-interval`, Kalman result
-columns.
+filtered-basestation outputs, Kalman result columns.
 
 To migrate from mlat-server, read [docs/MIGRATION.md](docs/MIGRATION.md).
 

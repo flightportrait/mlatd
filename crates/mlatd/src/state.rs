@@ -11,6 +11,15 @@ use std::time::Instant;
 
 pub struct ReceiverInfo {
     pub user: String,
+    /// Process-wide serial, mlat-server's `uid`: what aircraft.json's
+    /// tracking_receivers lists.
+    pub uid: u64,
+    pub uuid: Option<String>,
+    pub privacy: bool,
+    /// mlat-server's connection_info string, for clients.json.
+    pub connection_info: String,
+    pub source_ip: String,
+    pub source_port: u16,
     pub geo: Geodetic,
     pub ecef: Ecef,
     pub freq_hz: f64,
@@ -78,6 +87,46 @@ struct RxBias {
 const QUARANTINE_MAD_S: f64 = 1.5e-6;
 const QUARANTINE_MIN_N: u32 = 30;
 
+/// Aircraft an export entry remembers: not seen this long, it drops out.
+const AC_EXPIRE_S: f64 = 3600.0;
+/// A receiver counts as hearing / syncing on an aircraft for this long
+/// after its last message from it.
+const INTEREST_S: f64 = 60.0;
+
+/// Per-receiver export bookkeeping (clients.json): what it sent since
+/// the last export and which aircraft it is contributing to.
+#[derive(Default)]
+struct RxLog {
+    /// Messages since the last export (mlat-server: message_counter).
+    msgs: u64,
+    /// icao → last scaled time this receiver reported a sync pair on it.
+    sync: HashMap<Icao, f64>,
+    /// icao → last scaled time this receiver reported an mlat frame on it.
+    mlat: HashMap<Icao, f64>,
+    /// Fudged map position (None under privacy), mlat-server's mapLat/Lon.
+    map_pos: Option<(f64, f64)>,
+}
+
+/// Per-aircraft export bookkeeping (aircraft.json).
+#[derive(Default)]
+struct AcLog {
+    seen: f64,
+    /// Sync observations accepted / gate-rejected, decayed 0.8 per export
+    /// like mlat-server's sync_good / sync_bad.
+    sync_good: f64,
+    sync_bad: f64,
+    mlat_msgs: u64,
+    results: u64,
+    /// (scaled time, position) of the last two published fixes; two give
+    /// heading and speed.
+    last_fix: Option<(f64, Geodetic)>,
+    prev_fix: Option<(f64, Geodetic)>,
+    /// receiver slot → last scaled time it reported an mlat frame.
+    rx_mlat: HashMap<usize, f64>,
+    /// receiver slot → last scaled time it reported a sync pair.
+    rx_sync: HashMap<usize, f64>,
+}
+
 /// A published fix, fanned out to CSV + SBS + subscribed clients.
 pub struct Published {
     pub sbs_line: String,
@@ -107,6 +156,8 @@ pub struct State {
     /// gate-rejected). Decayed by 0.25 at each stats read, as mlat-server
     /// decays its equivalents.
     rx_sync: Vec<(f64, f64)>,
+    rx_log: Vec<RxLog>,
+    ac_log: HashMap<Icao, AcLog>,
     pub receivers: Vec<ReceiverInfo>,
     /// Slot generation, bumped on every reuse. Messages from a connection
     /// that lost its slot (reconnect dedupe, disconnect race) carry a stale
@@ -152,6 +203,8 @@ impl State {
             emit_filtered,
             rx_bias: Vec::new(),
             rx_sync: Vec::new(),
+            rx_log: Vec::new(),
+            ac_log: HashMap::new(),
             receivers: Vec::new(),
             gens: Vec::new(),
             alive: Vec::new(),
@@ -204,11 +257,16 @@ impl State {
         }
         let gps = info.gps;
         let user = info.user.clone();
+        let log = RxLog {
+            map_pos: map_position(&info),
+            ..Default::default()
+        };
         let idx = match self.free_slots.pop() {
             Some(i) => {
                 self.receivers[i] = info;
                 self.rx_bias[i] = RxBias::default();
                 self.rx_sync[i] = (0.0, 0.0);
+                self.rx_log[i] = log;
                 self.gens[i] = self.gens[i].wrapping_add(1);
                 self.alive[i] = true;
                 i
@@ -217,6 +275,7 @@ impl State {
                 self.receivers.push(info);
                 self.rx_bias.push(RxBias::default());
                 self.rx_sync.push((0.0, 0.0));
+                self.rx_log.push(log);
                 self.gens.push(0);
                 self.alive.push(true);
                 self.receivers.len() - 1
@@ -285,6 +344,13 @@ impl State {
         };
         if de.icao != do_.icao || de.odd || !do_.odd {
             return;
+        }
+        self.rx_log[rx].msgs += 1;
+        self.rx_log[rx].sync.insert(de.icao, at_scaled);
+        {
+            let a = self.ac_log.entry(de.icao).or_default();
+            a.seen = at_scaled;
+            a.rx_sync.insert(rx, at_scaled);
         }
         // Both decodes of the pair — each message gets its own position for
         // the propagation correction (aircraft move ~150 m between them).
@@ -363,10 +429,13 @@ impl State {
                 let ok = self.pairs.entry((a, b)).or_default().push(ta, tb);
                 self.pairs.entry((b, a)).or_default().push(tb, ta);
                 let slot = &mut self.rx_sync[rx];
+                let a = self.ac_log.entry(de.icao).or_default();
                 if ok {
                     slot.0 += 1.0;
+                    a.sync_good += 1.0;
                 } else {
                     slot.1 += 1.0;
+                    a.sync_bad += 1.0;
                 }
                 self.stats_sync_obs += 1;
             }
@@ -405,6 +474,14 @@ impl State {
             },
             _ => return,
         };
+        self.rx_log[rx].msgs += 1;
+        self.rx_log[rx].mlat.insert(icao, at_scaled);
+        {
+            let a = self.ac_log.entry(icao).or_default();
+            a.seen = at_scaled;
+            a.mlat_msgs += 1;
+            a.rx_mlat.insert(rx, at_scaled);
+        }
         let t_s = t_counts / self.receivers[rx].freq_hz;
         let g = self
             .groups
@@ -776,6 +853,12 @@ impl State {
                 t.last_pos = Some(sol.pos);
                 t.last_time_scaled = now_scaled;
                 t.speed_rejects = 0;
+                {
+                    let a = self.ac_log.entry(icao).or_default();
+                    a.results += 1;
+                    a.prev_fix = a.last_fix;
+                    a.last_fix = Some((now_scaled, sol.pos));
+                }
                 let err_m = sol.err_est_m;
                 let row = format!(
                     "{:.3},{},,,{:.5},{:.5},{},{:.1},{},{},\"{}\",{},\n",
@@ -872,13 +955,205 @@ impl State {
                     );
                 }
             }
+            let (lat, lon) = match self.rx_log[i].map_pos {
+                Some((a, b)) => (serde_json::json!(a), serde_json::json!(b)),
+                None => (serde_json::Value::Null, serde_json::Value::Null),
+            };
             top.insert(
                 r.user.clone(),
-                serde_json::json!({ "peers": serde_json::Value::Object(peers) }),
+                serde_json::json!({
+                    "peers": serde_json::Value::Object(peers),
+                    "bad_syncs": self.bad_syncs(i),
+                    "lat": lat,
+                    "lon": lon,
+                }),
             );
         }
         serde_json::Value::Object(top)
     }
+
+    /// mlat-server's bad_syncs score for a receiver, on its 0..6 scale.
+    /// mlatd has one verdict, the bias quarantine; it maps to the score
+    /// the stats push already reports (bad_sync_timeout 60 = 0.4 × 150).
+    fn bad_syncs(&self, rx: usize) -> f64 {
+        let b = self.rx_bias[rx];
+        if b.n >= QUARANTINE_MIN_N && b.mad_s > QUARANTINE_MAD_S {
+            0.4
+        } else {
+            0.0
+        }
+    }
+
+    /// clients.json and aircraft.json in mlat-server's shape (its
+    /// coordinator._write_state), for this shard. Called once per export
+    /// period: it decays the per-aircraft sync counters, resets the
+    /// per-receiver message counters, and expires stale entries, as the
+    /// original does on its 15 s loop.
+    pub fn state_json(&mut self) -> (serde_json::Value, serde_json::Value) {
+        let now = self.scaled_now();
+        let fresh = |t: &f64| now - *t < INTEREST_S;
+
+        let mut clients = serde_json::Map::new();
+        for (i, r) in self.receivers.iter().enumerate() {
+            if !self.alive[i] {
+                continue;
+            }
+            let bad_syncs = self.bad_syncs(i);
+            let log = &mut self.rx_log[i];
+            log.sync.retain(|_, t| fresh(t));
+            log.mlat.retain(|_, t| fresh(t));
+            let peers: Vec<usize> = self
+                .pairs
+                .keys()
+                .filter(|(a, b)| *a == i && self.alive[*b])
+                .map(|(_, b)| *b)
+                .collect();
+            let bad_peers: Vec<&str> = peers
+                .iter()
+                .filter(|&&b| {
+                    let bb = self.rx_bias[b];
+                    bb.n >= QUARANTINE_MIN_N && bb.mad_s > QUARANTINE_MAD_S
+                })
+                .map(|&b| self.receivers[b].user.as_str())
+                .collect();
+            let (acc, rej) = self.rx_sync[i];
+            let outlier_percent = if acc + rej > 0.0 {
+                100.0 * rej / (acc + rej)
+            } else {
+                0.0
+            };
+            let mut sync_interest: Vec<String> = log.sync.keys().map(|k| k.to_hex()).collect();
+            let mut mlat_interest: Vec<String> = log.mlat.keys().map(|k| k.to_hex()).collect();
+            sync_interest.sort();
+            mlat_interest.sort();
+            clients.insert(
+                r.user.clone(),
+                serde_json::json!({
+                    "user": r.user,
+                    "uid": r.uid,
+                    "uuid": r.uuid,
+                    "coords": format!("{:.6},{:.6}", r.geo.lat_deg, r.geo.lon_deg),
+                    "lat": r.geo.lat_deg,
+                    "lon": r.geo.lon_deg,
+                    "alt": r.geo.alt_m,
+                    "privacy": r.privacy,
+                    "connection": r.connection_info,
+                    "source_ip": r.source_ip,
+                    "source_port": r.source_port,
+                    "message_rate": (log.msgs as f64 / 15.0).round() as u64,
+                    "peer_count": peers.len(),
+                    "bad_sync_timeout": (bad_syncs * 150.0).round() as u64,
+                    "outlier_percent": (outlier_percent * 10.0).round() / 10.0,
+                    "bad_peer_list": format!("{bad_peers:?}"),
+                    "sync_interest": sync_interest,
+                    "mlat_interest": mlat_interest,
+                }),
+            );
+            log.msgs = 0;
+        }
+
+        self.ac_log.retain(|_, a| now - a.seen < AC_EXPIRE_S);
+        let mut aircraft = serde_json::Map::new();
+        let alive = &self.alive;
+        let receivers = &self.receivers;
+        for (icao, a) in self.ac_log.iter_mut() {
+            a.rx_mlat.retain(|rx, t| fresh(t) && alive[*rx]);
+            a.rx_sync.retain(|rx, t| fresh(t) && alive[*rx]);
+            let elapsed_seen = ((now - a.seen) * 10.0).round() / 10.0;
+            let sync_count = (a.sync_good + a.sync_bad).round();
+            let sync_bad_percent = (1000.0 * a.sync_bad / (sync_count + 0.01)).round() / 10.0;
+            a.sync_good *= 0.8;
+            a.sync_bad *= 0.8;
+            let tracking: std::collections::BTreeSet<usize> =
+                a.rx_mlat.keys().chain(a.rx_sync.keys()).copied().collect();
+            let mut s = serde_json::json!({
+                "icao": icao.to_hex().to_uppercase(),
+                "elapsed_seen": elapsed_seen,
+                "interesting": u8::from(!a.rx_mlat.is_empty()),
+                "allow_mlat": 1,
+                "tracking": tracking.len(),
+                "sync_interest": a.rx_sync.len(),
+                "mlat_interest": a.rx_mlat.len(),
+                "adsb_seen": a.rx_sync.len(),
+                "mlat_message_count": a.mlat_msgs,
+                "mlat_result_count": a.results,
+                "mlat_kalman_count": 0,
+                "sync_count_1min": sync_count,
+                "sync_bad_percent": sync_bad_percent,
+            });
+            let o = s.as_object_mut().expect("object literal");
+            if let Some((t, pos)) = a.last_fix {
+                o.insert(
+                    "last_result".into(),
+                    serde_json::json!(((now - t) * 10.0).round() / 10.0),
+                );
+                o.insert(
+                    "lat".into(),
+                    serde_json::json!((pos.lat_deg * 1e4).round() / 1e4),
+                );
+                o.insert(
+                    "lon".into(),
+                    serde_json::json!((pos.lon_deg * 1e4).round() / 1e4),
+                );
+                if let Some(alt) = self.alts_ft.get(icao) {
+                    o.insert("alt".into(), serde_json::json!(alt));
+                }
+                if let Some((tp, prev)) = a.prev_fix {
+                    let dt = t - tp;
+                    if dt > 0.0 && dt < 120.0 {
+                        let d = prev.haversine_m(&pos);
+                        let speed_kt = d / dt / 0.514_444;
+                        o.insert(
+                            "heading".into(),
+                            serde_json::json!(bearing_deg(&prev, &pos).round()),
+                        );
+                        o.insert("speed".into(), serde_json::json!(speed_kt.round()));
+                    }
+                }
+            }
+            if elapsed_seen > 600.0 {
+                let uids: Vec<u64> = tracking.iter().map(|rx| receivers[*rx].uid).collect();
+                o.insert("tracking_receivers".into(), serde_json::json!(uids));
+            }
+            aircraft.insert(icao.to_hex().to_uppercase(), s);
+        }
+        (
+            serde_json::Value::Object(clients),
+            serde_json::Value::Object(aircraft),
+        )
+    }
+}
+
+/// mlat-server's map-position fudge: None under privacy; else snapped to a
+/// 1/20° grid with an offset inside the cell. The offset is a hash of the
+/// user name, not a random draw, so the fudged point survives restarts.
+fn map_position(info: &ReceiverInfo) -> Option<(f64, f64)> {
+    if info.privacy {
+        return None;
+    }
+    let precision = 20.0;
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in info.user.bytes() {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    let unit = |x: u64| (x % 10_000) as f64 / 10_000.0;
+    let off_x = -1.0 / precision + unit(h) / precision;
+    let off_y = -1.0 / precision + unit(h >> 20) / precision;
+    let snap = |v: f64, off: f64| ((v * precision).round() / precision + off) * 100.0;
+    Some((
+        snap(info.geo.lat_deg, off_x).round() / 100.0,
+        snap(info.geo.lon_deg, off_y).round() / 100.0,
+    ))
+}
+
+/// Initial bearing from a to b, degrees 0..360.
+fn bearing_deg(a: &Geodetic, b: &Geodetic) -> f64 {
+    let (la1, la2) = (a.lat_deg.to_radians(), b.lat_deg.to_radians());
+    let dlon = (b.lon_deg - a.lon_deg).to_radians();
+    let y = dlon.sin() * la2.cos();
+    let x = la1.cos() * la2.sin() - la1.sin() * la2.cos() * dlon.cos();
+    (y.atan2(x).to_degrees() + 360.0) % 360.0
 }
 
 /// SBS rows carry date/time strings; emit UTC derived from the unix stamp.
@@ -947,6 +1222,12 @@ mod tests {
         };
         ReceiverInfo {
             user: user.into(),
+            uid: 0,
+            uuid: None,
+            privacy: false,
+            connection_info: String::new(),
+            source_ip: "127.0.0.1".into(),
+            source_port: 0,
             ecef: geo.to_ecef(),
             geo,
             freq_hz: 12e6,
@@ -1001,5 +1282,62 @@ mod tests {
         let keys: Vec<&String> = json.as_object().unwrap().keys().collect();
         assert_eq!(keys, ["b"], "sync.json lists only live receivers");
         let _ = b;
+    }
+
+    #[test]
+    fn state_json_reports_clients_and_aircraft_in_mlat_server_shape() {
+        let mut s = state();
+        let mut a_info = rx_info("alice");
+        a_info.uid = 7;
+        a_info.uuid = Some("u-a".into());
+        let a = s.add_receiver(a_info);
+        let _b = s.add_receiver(rx_info("bob"));
+        // A DF11 all-call from 3c6444, heard by alice only.
+        s.on_mlat(a, 1000.0, "5d3c6444aabbcc", s.scaled_now());
+        let (clients, aircraft) = s.state_json();
+        let alice = &clients["alice"];
+        assert_eq!(alice["uid"], 7);
+        assert_eq!(alice["uuid"], "u-a");
+        assert_eq!(alice["coords"], "47.000000,-1.500000");
+        assert_eq!(alice["message_rate"], 0); // 1 message / 15 s rounds down
+        assert_eq!(alice["mlat_interest"], serde_json::json!(["3c6444"]));
+        assert_eq!(alice["sync_interest"], serde_json::json!([]));
+        assert_eq!(alice["bad_sync_timeout"], 0);
+        assert!(clients["bob"]["mlat_interest"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        let ac = &aircraft["3C6444"];
+        assert_eq!(ac["icao"], "3C6444");
+        assert_eq!(ac["tracking"], 1);
+        assert_eq!(ac["mlat_interest"], 1);
+        assert_eq!(ac["interesting"], 1);
+        assert_eq!(ac["mlat_message_count"], 1);
+        assert_eq!(ac["mlat_result_count"], 0);
+        assert!(ac.get("lat").is_none(), "no fix yet, no position");
+        assert!(ac.get("tracking_receivers").is_none(), "fresh aircraft");
+    }
+
+    #[test]
+    fn sync_json_carries_bad_syncs_and_fudged_position() {
+        let mut s = state();
+        s.add_receiver(rx_info("alice"));
+        let mut p = rx_info("private");
+        p.privacy = true;
+        s.add_receiver(p);
+        let j = s.sync_json();
+        assert_eq!(j["alice"]["bad_syncs"], 0.0);
+        let lat = j["alice"]["lat"].as_f64().unwrap();
+        let lon = j["alice"]["lon"].as_f64().unwrap();
+        assert!(
+            (lat - 47.0).abs() <= 0.06 && (lon + 1.5).abs() <= 0.06,
+            "{lat} {lon}"
+        );
+        assert!(j["private"]["lat"].is_null() && j["private"]["lon"].is_null());
+        // Deterministic: the same user fudges to the same point every time.
+        assert_eq!(
+            map_position(&rx_info("alice")),
+            map_position(&rx_info("alice"))
+        );
     }
 }

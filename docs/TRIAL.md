@@ -37,8 +37,8 @@ or more feeders with overlapping coverage produce positions.
 
 - Stdout: one statistics line every 10 s
   (`rx= sync_obs= solved= rejected=`).
-- `work/sync.json`: mlat-server's format; existing sync dashboards read
-  it unchanged.
+- `work/sync.json`, `work/clients.json`, `work/aircraft.json`:
+  mlat-server's formats; existing dashboards read them unchanged.
 - The SBS port (31003): feed it to a readsb instance the same way you
   ingest mlat-server results (`--net-connector=<host>,31003,sbs_in_mlat`),
   or have mlatd push with `--basestation-connect` instead.
@@ -62,6 +62,5 @@ run `fuzz` on it: receiver coordinates identify homes.
 
 ## Known gaps
 
-UDP transport, the filtered-basestation outputs, and `--status-interval`
-are not implemented; results return to clients in the "old" format only.
+UDP transport and the filtered-basestation outputs are not implemented; results return to clients in the "old" format only.
 If the trial needs one of these, say so.

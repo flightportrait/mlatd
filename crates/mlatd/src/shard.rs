@@ -48,6 +48,8 @@ pub enum ShardMsg {
     ReceiverStats(RxRef, oneshot::Sender<Option<(usize, f64, bool)>>),
     Stats(oneshot::Sender<(usize, u64, u64, u64)>),
     SyncJson(oneshot::Sender<serde_json::Value>),
+    /// clients.json and aircraft.json contents for this shard.
+    StateJson(oneshot::Sender<(serde_json::Value, serde_json::Value)>),
 }
 
 /// Shard → output task traffic.
@@ -338,6 +340,9 @@ pub async fn run_shard(
                     }
                     ShardMsg::SyncJson(reply) => {
                         let _ = reply.send(state.sync_json());
+                    }
+                    ShardMsg::StateJson(reply) => {
+                        let _ = reply.send(state.state_json());
                     }
                 }
             }
