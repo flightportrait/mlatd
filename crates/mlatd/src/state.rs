@@ -93,6 +93,13 @@ const AC_EXPIRE_S: f64 = 3600.0;
 /// A receiver counts as hearing / syncing on an aircraft for this long
 /// after its last message from it.
 const INTEREST_S: f64 = 60.0;
+/// A group member farther than this from the fix did not hear that
+/// aircraft: the radio horizon from FL450 to a 300 m mast is ~555 km
+/// (4/3-earth). Groups key on the raw message, so a short frame (DF4,
+/// DF11) that two aircraft happen to share inside the window joins
+/// receivers on both; each cluster solves on its own and its fix goes
+/// only to the members in range of it.
+const RESULT_RANGE_M: f64 = 600_000.0;
 
 /// Per-receiver export bookkeeping (clients.json): what it sent since
 /// the last export and which aircraft it is contributing to.
@@ -135,8 +142,8 @@ pub struct Published {
     /// Connection uids that get result_line: every receiver that heard the
     /// transmission the fix was solved from, as mlat-server's
     /// forward_results does (group.receivers, not only the solving
-    /// cluster). A broadcast to every client put foreign traffic on each
-    /// feeder's local map.
+    /// cluster), within RESULT_RANGE_M of the fix. A broadcast to every
+    /// client put foreign traffic on each feeder's local map.
     pub recipients: Arc<[u64]>,
 }
 
@@ -586,7 +593,6 @@ impl State {
         if members.len() < 4 {
             return;
         }
-        let recipients = self.recipients(&members);
         let local_ref = *members
             .iter()
             .max_by_key(|&&cand| {
@@ -648,16 +654,19 @@ impl State {
             while j < conv.len() && conv[j].1 - start_t <= CLUSTER_SPAN_S {
                 j += 1;
             }
-            self.solve_cluster(g.icao, g.df17, local_ref, &conv[i..j], &recipients);
+            self.solve_cluster(g.icao, g.df17, local_ref, &conv[i..j], &members);
             i = j;
         }
     }
 
-    /// Connection uids of a group's live receivers: who gets the result.
-    fn recipients(&self, members: &[usize]) -> Arc<[u64]> {
+    /// Connection uids of a group's live receivers in range of the fix:
+    /// who gets the result.
+    fn recipients(&self, members: &[usize], fix: &Geodetic) -> Arc<[u64]> {
         members
             .iter()
-            .filter(|&&rx| self.alive[rx])
+            .filter(|&&rx| {
+                self.alive[rx] && self.receivers[rx].geo.haversine_m(fix) <= RESULT_RANGE_M
+            })
             .map(|&rx| self.receivers[rx].uid)
             .collect()
     }
@@ -668,7 +677,7 @@ impl State {
         cluster_is_df17: bool,
         local_ref: usize,
         cluster: &[(usize, f64, f64, f64)],
-        recipients: &Arc<[u64]>,
+        members: &[usize],
     ) {
         // One observation per receiver: earliest (direct path; any duplicate
         // within a cluster would be multipath in the real world).
@@ -951,7 +960,7 @@ impl State {
                     published: Published {
                         sbs_line,
                         result_line,
-                        recipients: recipients.clone(),
+                        recipients: self.recipients(members, &sol.pos),
                     },
                 }));
             }
@@ -1348,28 +1357,43 @@ mod tests {
     fn results_go_to_the_receivers_that_heard_the_message() {
         let mut s = state();
         let mut refs = Vec::new();
-        for (i, u) in ["a", "b", "c", "d", "far"].iter().enumerate() {
+        for (i, u) in ["a", "b", "c", "d", "far", "atlanta"].iter().enumerate() {
             let mut info = rx_info(u);
             info.uid = 100 + i as u64;
+            if *u == "atlanta" {
+                info.geo = Geodetic {
+                    lat_deg: 33.75,
+                    lon_deg: -84.39,
+                    alt_m: 300.0,
+                };
+                info.ecef = info.geo.to_ecef();
+            }
             refs.push(s.add_receiver(info));
         }
-        // a..d hear one DF11; "far" hears nothing.
+        // a..d hear one DF11; "far" hears nothing; "atlanta" hears another
+        // aircraft that sent the same frame (a collision across the ocean).
         let now = s.scaled_now();
-        for r in &refs[..4] {
+        for r in refs[..4].iter().chain(&refs[5..]) {
             s.on_mlat(*r, 1000.0, "5d3c6444aabbcc", now);
         }
         s.remove_receiver(refs[3]); // gone before the solve
         let g = &s.groups["5d3c6444aabbcc"];
         let mut members: Vec<usize> = g.entries.iter().map(|e| e.0).collect();
         members.dedup();
+        let fix = Geodetic {
+            lat_deg: 47.3,
+            lon_deg: -1.2,
+            alt_m: 10_000.0,
+        };
         let p = Published {
             sbs_line: String::new(),
             result_line: String::new(),
-            recipients: s.recipients(&members),
+            recipients: s.recipients(&members, &fix),
         };
         assert!(p.is_for(100) && p.is_for(101) && p.is_for(102));
         assert!(!p.is_for(103), "disconnected receiver");
         assert!(!p.is_for(104), "a receiver that did not hear it");
+        assert!(!p.is_for(105), "same frame, another continent");
     }
 
     #[test]
