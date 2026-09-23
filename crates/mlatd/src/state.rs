@@ -7,6 +7,7 @@ use crate::solve::{self, Observation};
 use crate::track::TrackFilter;
 use mb_core::{Ecef, Geodetic, Icao, C_MPS};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Instant;
 
 pub struct ReceiverInfo {
@@ -131,6 +132,19 @@ struct AcLog {
 pub struct Published {
     pub sbs_line: String,
     pub result_line: String,
+    /// Connection uids that get result_line: every receiver that heard the
+    /// transmission the fix was solved from, as mlat-server's
+    /// forward_results does (group.receivers, not only the solving
+    /// cluster). A broadcast to every client put foreign traffic on each
+    /// feeder's local map.
+    pub recipients: Arc<[u64]>,
+}
+
+impl Published {
+    /// True when the connection with this uid should get result_line.
+    pub fn is_for(&self, uid: u64) -> bool {
+        self.recipients.contains(&uid)
+    }
 }
 
 pub struct State {
@@ -572,6 +586,7 @@ impl State {
         if members.len() < 4 {
             return;
         }
+        let recipients = self.recipients(&members);
         let local_ref = *members
             .iter()
             .max_by_key(|&&cand| {
@@ -633,9 +648,18 @@ impl State {
             while j < conv.len() && conv[j].1 - start_t <= CLUSTER_SPAN_S {
                 j += 1;
             }
-            self.solve_cluster(g.icao, g.df17, local_ref, &conv[i..j]);
+            self.solve_cluster(g.icao, g.df17, local_ref, &conv[i..j], &recipients);
             i = j;
         }
+    }
+
+    /// Connection uids of a group's live receivers: who gets the result.
+    fn recipients(&self, members: &[usize]) -> Arc<[u64]> {
+        members
+            .iter()
+            .filter(|&&rx| self.alive[rx])
+            .map(|&rx| self.receivers[rx].uid)
+            .collect()
     }
 
     fn solve_cluster(
@@ -644,6 +668,7 @@ impl State {
         cluster_is_df17: bool,
         local_ref: usize,
         cluster: &[(usize, f64, f64, f64)],
+        recipients: &Arc<[u64]>,
     ) {
         // One observation per receiver: earliest (direct path; any duplicate
         // within a cluster would be multipath in the real world).
@@ -926,6 +951,7 @@ impl State {
                     published: Published {
                         sbs_line,
                         result_line,
+                        recipients: recipients.clone(),
                     },
                 }));
             }
@@ -1316,6 +1342,34 @@ mod tests {
         assert_eq!(ac["mlat_result_count"], 0);
         assert!(ac.get("lat").is_none(), "no fix yet, no position");
         assert!(ac.get("tracking_receivers").is_none(), "fresh aircraft");
+    }
+
+    #[test]
+    fn results_go_to_the_receivers_that_heard_the_message() {
+        let mut s = state();
+        let mut refs = Vec::new();
+        for (i, u) in ["a", "b", "c", "d", "far"].iter().enumerate() {
+            let mut info = rx_info(u);
+            info.uid = 100 + i as u64;
+            refs.push(s.add_receiver(info));
+        }
+        // a..d hear one DF11; "far" hears nothing.
+        let now = s.scaled_now();
+        for r in &refs[..4] {
+            s.on_mlat(*r, 1000.0, "5d3c6444aabbcc", now);
+        }
+        s.remove_receiver(refs[3]); // gone before the solve
+        let g = &s.groups["5d3c6444aabbcc"];
+        let mut members: Vec<usize> = g.entries.iter().map(|e| e.0).collect();
+        members.dedup();
+        let p = Published {
+            sbs_line: String::new(),
+            result_line: String::new(),
+            recipients: s.recipients(&members),
+        };
+        assert!(p.is_for(100) && p.is_for(101) && p.is_for(102));
+        assert!(!p.is_for(103), "disconnected receiver");
+        assert!(!p.is_for(104), "a receiver that did not hear it");
     }
 
     #[test]

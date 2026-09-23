@@ -626,9 +626,17 @@ async fn handle_client(
         let mut sub = publish.subscribe();
         let tx = tx_line.clone();
         tokio::spawn(async move {
-            while let Ok(p) = sub.recv().await {
-                if tx.send(p.result_line.clone()).await.is_err() {
-                    break;
+            // Only fixes this receiver heard the message for, as
+            // mlat-server's forward_results.
+            loop {
+                match sub.recv().await {
+                    Ok(p) if p.is_for(uid) => {
+                        if tx.send(p.result_line.clone()).await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
             }
         });
