@@ -18,6 +18,7 @@ selective traffic. The migration is a server-side swap.
 | (Kalman result columns) | `--write-filtered-csv` | Alpha-beta smoothing, experimental, off by default. |
 | — | `--shards`, `--shard-cell-deg`, `--shard-cap` | Internal geographic partition; it adapts to feeder density on its own. This replaces manual partitioning across multiple instances. The flags are overrides. |
 | (MAX_SYNC_AC = 15, fixed) | `--sync-aircraft-per-receiver` (0 = off) | Same policy when set: a receiver keeps sending sync pairs for at most this many ADS-B aircraft. mlatd does not need it for CPU; use it when feeder uplinks are the constraint. |
+| — | `--no-client-results` | Refuses `return_results` in the handshake: results reach only the SBS output and CSVs. By default a result goes to the receivers that heard its message, as in mlat-server. |
 | — | `--self-truth-csv` | Live accuracy measurement: mlatd also multilaterates ADS-B aircraft and compares each fix with the transmitted position. |
 
 ## Operational differences

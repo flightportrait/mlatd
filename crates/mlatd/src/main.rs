@@ -60,6 +60,11 @@ struct Cli {
     /// reconnect. mlat-server's flag name; may repeat.
     #[arg(long)]
     basestation_connect: Vec<String>,
+    /// Refuse return_results: clients get no result messages, whatever
+    /// their handshake asks; results reach only the SBS output and CSVs.
+    /// mlat-server has no such flag.
+    #[arg(long)]
+    no_client_results: bool,
     /// Work dir: sync.json, clients.json and aircraft.json are written
     /// here every 15 s in mlat-server's format, so existing monitoring
     /// keeps working (plus partition.json, the shard map).
@@ -403,6 +408,7 @@ async fn main() -> Result<()> {
         let scale = cli.time_scale;
         let uid = uid_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let sync_cap = cli.sync_aircraft_per_receiver;
+        let client_results = !cli.no_client_results;
         tokio::spawn(async move {
             let cfg = ClientCfg {
                 hb_real,
@@ -410,6 +416,7 @@ async fn main() -> Result<()> {
                 epoch: (epoch_unix, epoch_real),
                 uid,
                 sync_cap,
+                client_results,
             };
             if let Err(e) = handle_client(stream, router, publish, cfg).await {
                 eprintln!("mlatd: {peer}: {e:#}");
@@ -442,6 +449,8 @@ struct ClientCfg {
     uid: u64,
     /// ADS-B sync aircraft cap per receiver; 0 = unlimited.
     sync_cap: usize,
+    /// False under --no-client-results.
+    client_results: bool,
 }
 
 async fn handle_client(
@@ -456,6 +465,7 @@ async fn handle_client(
         epoch,
         uid,
         sync_cap,
+        client_results,
     } = cfg;
     let (conn_t0_unix, conn_t0) = epoch;
     stream.set_nodelay(true)?;
@@ -555,7 +565,7 @@ async fn handle_client(
         .await
         .map_err(|_| anyhow::anyhow!("shard gone"))?;
     let rx = orx.await.map_err(|_| anyhow::anyhow!("shard gone"))?;
-    let wants_results = hs["return_results"].as_bool().unwrap_or(false);
+    let wants_results = client_results && hs["return_results"].as_bool().unwrap_or(false);
     let wants_stats = hs["return_stats"].as_bool().unwrap_or(false);
     // A real mlat-client sends no traffic until asked: selective traffic is
     // the request channel (observed with 5 real clients: connected, decoded

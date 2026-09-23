@@ -74,6 +74,7 @@ receives receiver coordinates. Bind the port to a private interface.
 | `--self-truth-csv` | off | also multilaterates ADS-B frames and scores each fix against the position the aircraft transmitted |
 | `--shards` | auto (cores−2) | number of geographic shards in the process |
 | `--shard-cell-deg` / `--shard-cap` | 5.0 / 64 | base partition cell size and shard receiver capacity; dense cells subdivide on their own — overrides, not tuning knobs |
+| `--no-client-results` | off | refuse `return_results`: results go only to the SBS output and CSVs, never back to clients |
 | `--sync-aircraft-per-receiver` | 0 (unlimited) | ADS-B aircraft a receiver keeps sending sync pairs for (mlat-server caps at 15); Mode-S targets are never capped; a relief valve for a saturated uplink |
 | `--write-filtered-csv` | off | alpha-beta-smoothed results (experimental) |
 | `--time-scale` / `--group-window-ms` | 1 / 900 | bench-replay support; do not change in production |
