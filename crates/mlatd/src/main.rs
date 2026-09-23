@@ -69,18 +69,16 @@ struct Cli {
     /// mlat-server's flag; rounded up to the 10 s stats cadence.
     #[arg(long, default_value_t = 15, allow_hyphen_values = true)]
     status_interval: i64,
-    /// Shard count (0 = auto: one per available core). Each shard owns an
-    /// independent geographic slice; see shard.rs. Shards are the scaling
-    /// lever: on the 2026-09-21 drill (500 receivers, one country) 2 cores
-    /// gave 0.3 % coverage with one shard and 7.9 % with two; 4 cores and
-    /// four shards 25 %; mlat-server on the same traffic 0 %.
+    /// Shard count (0 = auto: available cores − 2, min 1). Each shard owns
+    /// an independent geographic slice; see shard.rs. Receivers on
+    /// different shards never sync with each other, so more shards trade
+    /// co-hearing pairs for CPU: raise it only on a CPU-bound hub.
     #[arg(long, default_value_t = 0)]
     shards: usize,
-    /// Base geographic cell size for shard assignment, degrees. 2° is the
-    /// co-hearing floor and the default: coarser cells let one shard claim
-    /// a whole country in the first second of a connect burst (5° cells on
-    /// the 2026-09-21 drill: 2 of 4 shards used). An override, not a knob.
-    #[arg(long, default_value_t = 2.0)]
+    /// Base geographic cell size for shard assignment, degrees. Dense
+    /// cells split automatically, stopping at the 2° physical floor; the
+    /// flag is an override, not something a deployment should need.
+    #[arg(long, default_value_t = 5.0)]
     shard_cell_deg: f64,
     /// Receiver capacity per shard before region growth spills over
     /// (message rate gates growth too).
@@ -111,7 +109,7 @@ async fn main() -> Result<()> {
     let mlat_adsb = cli.self_truth_csv.is_some();
     let n_shards = if cli.shards == 0 {
         std::thread::available_parallelism()
-            .map(|n| n.get().max(1))
+            .map(|n| (n.get().saturating_sub(2)).max(1))
             .unwrap_or(1)
     } else {
         cli.shards

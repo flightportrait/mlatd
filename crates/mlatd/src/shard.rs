@@ -186,25 +186,6 @@ impl Router {
             && h.rate.load(std::sync::atomic::Ordering::Relaxed) < CAP_RATE_PER_WINDOW
     }
 
-    /// Fair share of ground: a shard may claim a new cell only while it
-    /// owns at most one cell more than the emptiest shard. Receiver and
-    /// rate gates act too slowly for a connect burst: 500 receivers over
-    /// one country arrive in a second, a contiguous region's cells are
-    /// all touched before any shard reaches its receiver cap, and the
-    /// neighbor vote then hands the whole country to whichever shard
-    /// seeded first (2026-09-21 drill: 478 of 500 receivers on one of
-    /// four shards, the split a lottery of connect order).
-    fn fair_share(&self, map: &CellMap, shard: usize) -> bool {
-        let mut owned = vec![0usize; self.shards.len()];
-        for &o in map.owner.values() {
-            if o < owned.len() {
-                owned[o] += 1;
-            }
-        }
-        let min = owned.iter().copied().min().unwrap_or(0);
-        owned[shard] <= min + 1
-    }
-
     fn load_of(&self, shard: usize) -> (u64, usize) {
         let h = &self.shards[shard];
         (
@@ -240,7 +221,7 @@ impl Router {
                         let nlat = clat + f64::from(dy) * size;
                         let nlon = clon + f64::from(dx) * size;
                         if let Some(n) = self.owner_at(&map, nlat, nlon) {
-                            if self.has_capacity(n) && self.fair_share(&map, n) {
+                            if self.has_capacity(n) {
                                 *votes.entry(n).or_insert(0) += 1;
                             }
                         }
@@ -262,16 +243,8 @@ impl Router {
                     // shard from claiming new ground.
                     .or_else(|| self.owner_at(&map, lat, lon))
                     .unwrap_or_else(|| {
-                        // Seed a region on the shard with the least ground,
-                        // then the least load.
-                        let mut owned = vec![0usize; self.shards.len()];
-                        for &o in map.owner.values() {
-                            if o < owned.len() {
-                                owned[o] += 1;
-                            }
-                        }
                         (0..self.shards.len())
-                            .min_by_key(|&sh| (owned[sh], self.load_of(sh)))
+                            .min_by_key(|&sh| self.load_of(sh))
                             .unwrap_or(0)
                     });
                 map.owner.insert(key, i);
@@ -405,6 +378,20 @@ mod tests {
     }
 
     #[test]
+    fn a_contiguous_region_stays_on_one_shard() {
+        // 0.4.0 spread a region's cells evenly over shards to balance a
+        // connect burst. On a real one-country network that cut syncs
+        // from 4,321 to 2,400: receivers hearing the same aircraft landed
+        // on different shards. Below the capacity gate a region stays whole.
+        let r = router(4, 64);
+        let first = r.shard_for(4.0, 4.0).0;
+        for i in 1..12 {
+            let (sh, _) = r.shard_for(4.0, 4.0 + 8.0 * i as f64);
+            assert_eq!(sh, first, "cell {i} left the region's shard");
+        }
+    }
+
+    #[test]
     fn dense_cells_split_and_children_inherit() {
         let r = router(4, 1000);
         let (owner, _) = r.shard_for(1.3, 103.8);
@@ -417,22 +404,6 @@ mod tests {
         // inherits the parent's shard through the ancestor fallback.
         let (child_owner, _) = r.shard_for(6.9, 100.1);
         assert_eq!(child_owner, owner);
-    }
-
-    #[test]
-    fn a_contiguous_region_spreads_over_shards_regardless_of_order() {
-        // 12 adjacent 8° cells claimed one after another by a single
-        // receiver each: neighbor affinity alone would give them all to
-        // the first shard; fair share keeps the split within one cell.
-        let r = router(4, 64);
-        for i in 0..12 {
-            r.shard_for(4.0, 4.0 + 8.0 * i as f64);
-        }
-        let mut owned = vec![0usize; 4];
-        for (_, _, _, sh, _) in r.partition_dump() {
-            owned[sh] += 1;
-        }
-        assert!(owned.iter().all(|&n| n >= 2), "{owned:?}");
     }
 
     #[test]
