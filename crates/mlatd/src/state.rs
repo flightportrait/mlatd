@@ -88,8 +88,16 @@ struct RxBias {
 const QUARANTINE_MAD_S: f64 = 1.5e-6;
 const QUARANTINE_MIN_N: u32 = 30;
 
-/// Aircraft an export entry remembers: not seen this long, it drops out.
-const AC_EXPIRE_S: f64 = 3600.0;
+/// An aircraft not heard for this long leaves every per-aircraft map:
+/// the export entry, its track, altitude, own-position reference and
+/// smoothing filter. Nothing reads older state (warm start 60 s, dof rule
+/// 30 s, INTEREST_S 60 s), and mlat-server's aircraft.json lists live
+/// aircraft only. At 3600 s a busy network held 16,000+ aircraft per
+/// status tick; the solver-side maps had no expiry at all and grew for
+/// the life of the process.
+const AC_EXPIRE_S: f64 = 300.0;
+/// How often a shard's sweep runs the expiry pass (real seconds).
+const EXPIRE_EVERY_S: f64 = 10.0;
 /// A receiver counts as hearing / syncing on an aircraft for this long
 /// after its last message from it.
 const INTEREST_S: f64 = 60.0;
@@ -202,6 +210,7 @@ pub struct State {
     t0_real: Instant,
     t0_unix: f64,
     time_scale: f64,
+    last_expire: Instant,
     pub stats_solved: u64,
     pub stats_rejected: u64,
     pub stats_sync_obs: u64,
@@ -244,6 +253,7 @@ impl State {
             t0_unix: epoch.0,
             t0_real: epoch.1,
             time_scale,
+            last_expire: Instant::now(),
             stats_solved: 0,
             stats_rejected: 0,
             stats_sync_obs: 0,
@@ -544,11 +554,17 @@ impl State {
         self.alive.iter().filter(|a| **a).count()
     }
 
-    /// Sweep: solve groups older than the window, expire stale sync points.
+    /// Sweep: solve groups older than the window, expire stale sync points,
+    /// and every EXPIRE_EVERY_S drop aircraft not heard for AC_EXPIRE_S.
     pub fn sweep(&mut self, window: std::time::Duration) {
         let now = Instant::now();
         self.syncpoints
             .retain(|_, sp| now.duration_since(sp.created).as_secs_f64() < 4.0);
+        if now.duration_since(self.last_expire).as_secs_f64() >= EXPIRE_EVERY_S {
+            self.last_expire = now;
+            let scaled = self.scaled_now();
+            self.expire_at(scaled);
+        }
 
         let ready: Vec<String> = self
             .groups
@@ -669,6 +685,35 @@ impl State {
             })
             .map(|&rx| self.receivers[rx].uid)
             .collect()
+    }
+
+    /// Drop every trace of aircraft not heard for AC_EXPIRE_S, and the
+    /// per-receiver interest older than INTEREST_S. Every write to
+    /// alts_ft, adsb_pos, tracks and filters follows a touch of the
+    /// aircraft's ac_log entry, so ac_log membership is the one rule. Ran
+    /// only from the work-dir export before, so a hub without --work-dir
+    /// never expired anything, and the four solver maps never expired at
+    /// all.
+    fn expire_at(&mut self, now: f64) {
+        let fresh = |t: &f64| now - *t < INTEREST_S;
+        self.ac_log.retain(|_, a| now - a.seen < AC_EXPIRE_S);
+        let alive = &self.alive;
+        for a in self.ac_log.values_mut() {
+            a.rx_mlat.retain(|rx, t| fresh(t) && alive[*rx]);
+            a.rx_sync.retain(|rx, t| fresh(t) && alive[*rx]);
+        }
+        let live = &self.ac_log;
+        self.alts_ft.retain(|k, _| live.contains_key(k));
+        self.adsb_pos.retain(|k, _| live.contains_key(k));
+        self.tracks.retain(|k, _| live.contains_key(k));
+        self.filters.retain(|k, _| live.contains_key(k));
+        for (i, log) in self.rx_log.iter_mut().enumerate() {
+            if !alive[i] {
+                continue;
+            }
+            log.sync.retain(|_, t| fresh(t));
+            log.mlat.retain(|_, t| fresh(t));
+        }
     }
 
     fn solve_cluster(
@@ -1026,7 +1071,7 @@ impl State {
     /// original does on its 15 s loop.
     pub fn state_json(&mut self) -> (serde_json::Value, serde_json::Value) {
         let now = self.scaled_now();
-        let fresh = |t: &f64| now - *t < INTEREST_S;
+        self.expire_at(now);
 
         let mut clients = serde_json::Map::new();
         for (i, r) in self.receivers.iter().enumerate() {
@@ -1035,8 +1080,6 @@ impl State {
             }
             let bad_syncs = self.bad_syncs(i);
             let log = &mut self.rx_log[i];
-            log.sync.retain(|_, t| fresh(t));
-            log.mlat.retain(|_, t| fresh(t));
             let peers: Vec<usize> = self
                 .pairs
                 .keys()
@@ -1087,13 +1130,9 @@ impl State {
             log.msgs = 0;
         }
 
-        self.ac_log.retain(|_, a| now - a.seen < AC_EXPIRE_S);
         let mut aircraft = serde_json::Map::new();
-        let alive = &self.alive;
         let receivers = &self.receivers;
         for (icao, a) in self.ac_log.iter_mut() {
-            a.rx_mlat.retain(|rx, t| fresh(t) && alive[*rx]);
-            a.rx_sync.retain(|rx, t| fresh(t) && alive[*rx]);
             let elapsed_seen = ((now - a.seen) * 10.0).round() / 10.0;
             let sync_count = (a.sync_good + a.sync_bad).round();
             let sync_bad_percent = (1000.0 * a.sync_bad / (sync_count + 0.01)).round() / 10.0;
@@ -1351,6 +1390,40 @@ mod tests {
         assert_eq!(ac["mlat_result_count"], 0);
         assert!(ac.get("lat").is_none(), "no fix yet, no position");
         assert!(ac.get("tracking_receivers").is_none(), "fresh aircraft");
+    }
+
+    #[test]
+    fn expiry_empties_every_per_aircraft_map() {
+        let mut s = state();
+        let rx = s.add_receiver(rx_info("a"));
+        let now = s.scaled_now();
+        s.on_mlat(rx, 1000.0, "5d3c6444aabbcc", now);
+        let icao = *s.ac_log.keys().next().expect("logged");
+        s.alts_ft.insert(icao, 35_000);
+        s.tracks.entry(icao).or_default();
+        let pos = rx_info("a").geo;
+        s.adsb_pos.insert(icao, (pos, now));
+        s.filters.insert(icao, TrackFilter::new(pos, now));
+
+        s.expire_at(now + INTEREST_S - 1.0);
+        assert!(
+            s.rx_log[rx.idx].mlat.contains_key(&icao),
+            "interest under INTEREST_S"
+        );
+
+        s.expire_at(now + AC_EXPIRE_S - 1.0);
+        assert_eq!(s.ac_log.len(), 1, "still fresh");
+        assert!(s.alts_ft.contains_key(&icao) && s.tracks.contains_key(&icao));
+        assert!(
+            s.rx_log[rx.idx].mlat.is_empty(),
+            "interest gone before the aircraft"
+        );
+
+        s.expire_at(now + AC_EXPIRE_S);
+        assert!(s.ac_log.is_empty());
+        assert!(s.alts_ft.is_empty() && s.adsb_pos.is_empty());
+        assert!(s.tracks.is_empty() && s.filters.is_empty());
+        assert!(s.rx_log[rx.idx].mlat.is_empty());
     }
 
     #[test]
