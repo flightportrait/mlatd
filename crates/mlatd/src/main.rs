@@ -534,6 +534,13 @@ async fn handle_client(
             .await?;
         anyhow::bail!("handshake missing position");
     };
+    // mlat-server's ranges (coordinator.py): a receiver placed off the
+    // planet would enter the shard map and every pair geometry as is.
+    if !plausible_position(lat, lon, alt) {
+        wr.write_all(b"{\"deny\":[\"invalid position\"],\"reconnect_in\":300}\n")
+            .await?;
+        anyhow::bail!("handshake position out of range: {lat} {lon} {alt}");
+    }
     let clock_type = hs["clock_type"].as_str().unwrap_or("unknown").to_string();
     let freq_hz = match clock_type.as_str() {
         "radarcape_gps" | "radarcape" => 1e9,
@@ -869,6 +876,9 @@ async fn process_line_tx(
         ) else {
             return;
         };
+        if !plausible_counts(et) || !plausible_counts(ot) {
+            return;
+        }
         // The ADS-B cap: a sync pair from an aircraft beyond this
         // receiver's quota is dropped and the client told to stop it.
         if let Some(icao) = traffic::adsb_icao(em) {
@@ -894,6 +904,9 @@ async fn process_line_tx(
         let (Some(t), Some(m)) = (ml["t"].as_f64(), ml["m"].as_str()) else {
             return;
         };
+        if !plausible_counts(t) {
+            return;
+        }
         let _ = shard
             .tx
             .send(ShardMsg::Mlat {
@@ -907,6 +920,22 @@ async fn process_line_tx(
         let _ = shard.tx.send(ShardMsg::ClockReset(rx)).await;
     }
     // seen/lost/heartbeat/rate_report/input_*: no state needed yet.
+}
+
+/// mlat-server's receiver position ranges: latitude and longitude on the
+/// planet, altitude between −1000 m and 10,000 m.
+fn plausible_position(lat: f64, lon: f64, alt: f64) -> bool {
+    (-90.0..=90.0).contains(&lat)
+        && (-180.0..=180.0).contains(&lon)
+        && (-1000.0..=10000.0).contains(&alt)
+}
+
+/// A receiver clock reading in counts: finite and inside the integer range
+/// of a double. Anything else would flow into the pair models as ±inf or
+/// NaN, where the outlier gate cannot reject it (NaN compares false) and a
+/// disconnect is the only reset.
+fn plausible_counts(t: f64) -> bool {
+    t.is_finite() && (0.0..9.007_199_254_740_992e15).contains(&t)
 }
 
 /// Write the broadcast fix stream to one SBS consumer until it goes away.
@@ -935,6 +964,20 @@ async fn sbs_writer(mut sock: TcpStream, mut rx: tokio::sync::broadcast::Receive
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, AtomicUsize};
+
+    #[test]
+    fn implausible_input_is_refused() {
+        assert!(plausible_position(1.35, 103.8, 20.0));
+        assert!(!plausible_position(91.0, 0.0, 0.0));
+        assert!(!plausible_position(0.0, 181.0, 0.0));
+        assert!(!plausible_position(0.0, 0.0, 20_000.0));
+        assert!(!plausible_position(f64::NAN, 0.0, 0.0));
+        assert!(plausible_counts(1.2e9));
+        assert!(!plausible_counts(-1.0));
+        assert!(!plausible_counts(f64::INFINITY));
+        assert!(!plausible_counts(f64::NAN));
+        assert!(!plausible_counts(1e300));
+    }
 
     /// A return_results connection that closes must finish its teardown.
     /// The result forwarder held a clone of the writer's sender and only
