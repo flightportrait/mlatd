@@ -286,8 +286,15 @@ async fn main() -> Result<()> {
             };
             println!("mlatd: SBS output on {addr}");
             loop {
-                let Ok((sock, _)) = l.accept().await else {
-                    break;
+                // Same transient failures as the client listener; a break
+                // here left the process up with the SBS port dead.
+                let sock = match l.accept().await {
+                    Ok((sock, _)) => sock,
+                    Err(e) => {
+                        eprintln!("mlatd: SBS accept failed ({e}); retrying");
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        continue;
+                    }
                 };
                 let rx = publish.subscribe();
                 tokio::spawn(sbs_writer(sock, rx));
@@ -402,7 +409,18 @@ async fn main() -> Result<()> {
     println!("mlatd: listening on {listen}");
     let hb_real = Duration::from_secs_f64(30.0 / cli.time_scale);
     loop {
-        let (stream, peer) = listener.accept().await?;
+        // accept() fails transiently: EMFILE/ENFILE when descriptors run
+        // out, ECONNABORTED when the peer resets mid-handshake. Returning
+        // the error here ended the process; a short pause lets descriptors
+        // free up and the reset is nobody's problem.
+        let (stream, peer) = match listener.accept().await {
+            Ok(x) => x,
+            Err(e) => {
+                eprintln!("mlatd: accept failed ({e}); retrying");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
         let router = router.clone();
         let publish = publish.clone();
         let scale = cli.time_scale;
