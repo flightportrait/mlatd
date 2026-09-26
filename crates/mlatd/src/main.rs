@@ -587,7 +587,7 @@ async fn handle_client(
     // batched up to 1 s.
     let (tx_line, mut rx_line) = tokio::sync::mpsc::channel::<String>(256);
     let compress_down = negotiated == "zlib2";
-    let writer = tokio::spawn(async move {
+    let mut writer = tokio::spawn(async move {
         if !compress_down {
             while let Some(l) = rx_line.recv().await {
                 if wr.write_all(l.as_bytes()).await.is_err() {
@@ -632,7 +632,15 @@ async fn handle_client(
             }
         }
     });
-    if wants_results {
+    // The forwarder is aborted at teardown. It holds a clone of the
+    // writer's sender and would otherwise stop only when a send fails,
+    // which needs the writer gone, which needs every sender dropped: a
+    // cycle. A closed receiver hears nothing, so no fix is ever for it and
+    // the send that would have broken the cycle never came. Every closed
+    // return_results connection then kept its socket, both zlib states and
+    // three tasks for the life of the process (≈210 KB each; a hub with
+    // reconnecting feeders reached 2 GB RSS in 36 h).
+    let forwarder = wants_results.then(|| {
         let mut sub = publish.subscribe();
         let tx = tx_line.clone();
         tokio::spawn(async move {
@@ -649,8 +657,8 @@ async fn handle_client(
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
             }
-        });
-    }
+        })
+    });
 
     // ---- message loop ----------------------------------------------------
     // A connection silent for 5 minutes is dead (real clients heartbeat
@@ -740,8 +748,20 @@ async fn handle_client(
     shard
         .receivers
         .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    if let Some(f) = &forwarder {
+        f.abort();
+    }
     drop(tx_line);
-    let _ = writer.await;
+    // Flush what the writer still holds, but not for long: a peer that
+    // stopped reading with the socket still up blocks write_all until the
+    // kernel gives up on retransmits, and the socket must not outlive the
+    // connection by that much. Dropping the writer closes the write half.
+    if tokio::time::timeout(Duration::from_secs(5), &mut writer)
+        .await
+        .is_err()
+    {
+        writer.abort();
+    }
     println!("mlatd: {user} disconnected");
     res
 }
@@ -889,5 +909,66 @@ async fn sbs_writer(mut sock: TcpStream, mut rx: tokio::sync::broadcast::Receive
         if sock.write_all(&bytes).await.is_err() {
             break;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, AtomicUsize};
+
+    /// A return_results connection that closes must finish its teardown.
+    /// The result forwarder held a clone of the writer's sender and only
+    /// stopped when a send failed; a gone receiver hears nothing, so no
+    /// fix was ever for it, the send never happened, and handle_client
+    /// sat in `writer.await` forever with the socket and zlib state.
+    #[tokio::test]
+    async fn closed_results_connection_tears_down() {
+        let (out_tx, _out_rx) = mpsc::channel::<OutMsg>(64);
+        let (publish, _keep) = tokio::sync::broadcast::channel::<Arc<Published>>(16);
+        let (tx, rx) = mpsc::channel::<ShardMsg>(64);
+        let epoch = (0.0, std::time::Instant::now());
+        tokio::spawn(shard::run_shard(
+            State::new(0, 1.0, false, false, epoch),
+            rx,
+            out_tx,
+            Duration::from_millis(900),
+        ));
+        let handle = Arc::new(ShardHandle {
+            tx,
+            receivers: AtomicUsize::new(0),
+            rate: AtomicU64::new(0),
+        });
+        let router = Arc::new(Router::new(vec![handle], 1.0, 1000));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let cfg = ClientCfg {
+                hb_real: Duration::from_secs(30),
+                time_scale: 1.0,
+                epoch,
+                uid: 1,
+                sync_cap: 0,
+                client_results: true,
+            };
+            handle_client(stream, router, publish, cfg).await
+        });
+        let mut c = TcpStream::connect(addr).await.unwrap();
+        c.write_all(
+            b"{\"version\":3,\"compress\":[\"none\"],\"return_results\":true,\
+              \"user\":\"t\",\"lat\":1.0,\"lon\":103.0,\"alt\":10.0,\
+              \"clock_type\":\"dump1090\"}\n",
+        )
+        .await
+        .unwrap();
+        let mut reply = vec![0u8; 4096];
+        assert!(c.read(&mut reply).await.unwrap() > 0, "handshake reply");
+        drop(c);
+        tokio::time::timeout(Duration::from_secs(10), server)
+            .await
+            .expect("handle_client returns once the client has closed")
+            .unwrap()
+            .unwrap();
     }
 }
