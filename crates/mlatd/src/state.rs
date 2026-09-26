@@ -821,18 +821,19 @@ impl State {
         let init = match track.last_pos {
             Some(p) if now_scaled - track.last_time_scaled < 60.0 => Geodetic { alt_m, ..p },
             _ => {
-                let n = obs.len() as f64;
+                // Centroid of the observing receivers, by slot. A lookup by
+                // user name scanned every slot per member and could land on
+                // a freed slot that once held the same name.
+                let n = rx_ids.len() as f64;
                 Geodetic {
-                    lat_deg: users
+                    lat_deg: rx_ids
                         .iter()
-                        .filter_map(|u| self.receivers.iter().find(|r| &r.user == u))
-                        .map(|r| r.geo.lat_deg)
+                        .map(|&i| self.receivers[i].geo.lat_deg)
                         .sum::<f64>()
                         / n,
-                    lon_deg: users
+                    lon_deg: rx_ids
                         .iter()
-                        .filter_map(|u| self.receivers.iter().find(|r| &r.user == u))
-                        .map(|r| r.geo.lon_deg)
+                        .map(|&i| self.receivers[i].geo.lon_deg)
                         .sum::<f64>()
                         / n,
                     alt_m,
