@@ -702,8 +702,11 @@ async fn handle_client(
                     let mut limited = (&mut rd).take(256 * 1024);
                     tokio::select! {
                         _ = hb.tick() => {
+                            // try_send: a peer that stopped reading fills
+                            // the writer's queue, and an awaiting send here
+                            // would park the reader too, past the idle reaper.
                             let st = scaled_now(conn_t0_unix, conn_t0, time_scale);
-                            let _ = tx_line.send(format!("{{\"heartbeat\":{{\"server_time\":{st:.3}}}}}\n")).await;
+                            let _ = tx_line.try_send(format!("{{\"heartbeat\":{{\"server_time\":{st:.3}}}}}\n"));
                         }
                         _ = stats_tick.tick(), if wants_stats => {
                             push_stats(&shard, rx, &tx_line).await;
@@ -727,7 +730,7 @@ async fn handle_client(
                     tokio::select! {
                         _ = hb.tick() => {
                             let st = scaled_now(conn_t0_unix, conn_t0, time_scale);
-                            let _ = tx_line.send(format!("{{\"heartbeat\":{{\"server_time\":{st:.3}}}}}\n")).await;
+                            let _ = tx_line.try_send(format!("{{\"heartbeat\":{{\"server_time\":{st:.3}}}}}\n"));
                             continue
                         }
                         _ = stats_tick.tick(), if wants_stats => {
@@ -801,11 +804,9 @@ async fn push_stats(
     }
     if let Ok(Some((peers, outlier_percent, quarantined))) = orx.await {
         let bad_sync_timeout = if quarantined { 60 } else { 0 };
-        let _ = tx_line
-            .send(format!(
-                "{{\"stats\":{{\"peer_count\":{peers},\"bad_sync_timeout\":{bad_sync_timeout},\"outlier_percent\":{outlier_percent:.1}}}}}\n"
-            ))
-            .await;
+        let _ = tx_line.try_send(format!(
+            "{{\"stats\":{{\"peer_count\":{peers},\"bad_sync_timeout\":{bad_sync_timeout},\"outlier_percent\":{outlier_percent:.1}}}}}\n"
+        ));
     }
 }
 
