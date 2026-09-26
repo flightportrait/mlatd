@@ -102,6 +102,16 @@ fn ends_with_sync(b: &[u8]) -> bool {
     b.len() >= 4 && b[b.len() - 4..] == SYNC_TRAILER
 }
 
+/// Most a single frame may inflate to. A frame carries at most 65,535
+/// compressed bytes of JSON lines, which real clients inflate 5–10×; the
+/// deflate format itself allows ~1032×, so an uncapped decoder let one
+/// hostile 64 KB frame pin ~66 MB per connection. Over the cap the frame
+/// is an error and the caller drops the connection.
+pub const MAX_FRAME_OUT: usize = 4 * 1024 * 1024;
+/// Scratch capacity kept between frames; a larger buffer left by a big
+/// frame is released after it.
+const KEEP_OUT: usize = 1024 * 1024;
+
 /// Stateful decoder — the mirror image, used in tests and by the recorder to
 /// make captures inspectable. Feed whole frames (with length header).
 pub struct ZlibFrameDecoder {
@@ -165,18 +175,46 @@ impl ZlibFrameDecoder {
                         break;
                     }
                     let len = self.out.len();
+                    if len >= MAX_FRAME_OUT {
+                        self.out = Vec::with_capacity(16 * 1024);
+                        return Err(ProtoError::Framing(format!(
+                            "frame inflates past {} bytes",
+                            MAX_FRAME_OUT
+                        )));
+                    }
                     self.out.resize(len + 64 * 1024, 0);
                 }
                 flate2::Status::StreamEnd => break,
             }
         }
-        Ok(self.out[..out_off].to_vec())
+        let lines = self.out[..out_off].to_vec();
+        if self.out.capacity() > KEEP_OUT {
+            self.out = Vec::with_capacity(16 * 1024);
+        }
+        Ok(lines)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oversized_inflate_is_refused_and_the_buffer_released() {
+        let mut enc = ZlibFrameEncoder::new();
+        let mut dec = ZlibFrameDecoder::new();
+        // 8 MiB of one byte compresses to a few KB: a legal frame that
+        // inflates past the cap.
+        let bomb = vec![b'a'; 2 * MAX_FRAME_OUT];
+        let frame = enc.encode_frame(&bomb).expect("compressed frame fits");
+        assert!(dec.decode_frame(&frame).is_err());
+        assert!(dec.out.capacity() <= KEEP_OUT, "scratch released");
+        // A fresh decoder stream still works after the refusal on a new one.
+        let mut enc2 = ZlibFrameEncoder::new();
+        let mut dec2 = ZlibFrameDecoder::new();
+        let ok = enc2.encode_frame(b"{\"heartbeat\":{}}\n").unwrap();
+        assert_eq!(dec2.decode_frame(&ok).unwrap(), b"{\"heartbeat\":{}}\n");
+    }
 
     #[test]
     fn zlib_roundtrip_single_frame() {
