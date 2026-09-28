@@ -675,6 +675,39 @@ impl State {
         }
     }
 
+    /// A 4-receiver fix, with no spare equation to catch a bad receiver, is
+    /// published only where the track says the aircraft is: within a gate of
+    /// the position extrapolated from the last two published fixes. The gate
+    /// is the fix's own error (3σ, at least 500 m) plus 60 m per second of
+    /// extrapolation, which covers a standard-rate turn at airliner speed.
+    /// A track with fewer than two fixes, or fixes too old or too close
+    /// together to give a velocity, has no prediction: the fix waits, as
+    /// before, until the track starves.
+    fn four_rx_consistent(&self, icao: Icao, sol: &solve::Solution, now: f64) -> bool {
+        const GATE_SIGMAS: f64 = 3.0;
+        const GATE_FLOOR_M: f64 = 500.0;
+        const TURN_SLACK_MPS: f64 = 60.0;
+        let Some(a) = self.ac_log.get(&icao) else {
+            return false;
+        };
+        let (Some((t1, p1)), Some((t0, p0))) = (a.last_fix, a.prev_fix) else {
+            return false;
+        };
+        let span = t1 - t0;
+        let horizon = now - t1;
+        if !(1.0..=60.0).contains(&span) || !(0.0..30.0).contains(&horizon) {
+            return false;
+        }
+        let k = horizon / span;
+        let predicted = Geodetic {
+            lat_deg: p1.lat_deg + (p1.lat_deg - p0.lat_deg) * k,
+            lon_deg: p1.lon_deg + (p1.lon_deg - p0.lon_deg) * k,
+            alt_m: sol.pos.alt_m,
+        };
+        let gate = (GATE_SIGMAS * sol.err_est_m).max(GATE_FLOOR_M) + TURN_SLACK_MPS * horizon;
+        sol.pos.haversine_m(&predicted) <= gate
+    }
+
     /// Connection uids of a group's live receivers in range of the fix:
     /// who gets the result.
     fn recipients(&self, members: &[usize], fix: &Geodetic) -> Arc<[u64]> {
@@ -799,15 +832,15 @@ impl State {
         if now_scaled - track.last_attempt_scaled < Self::RESOLVE_BACKOFF_S {
             return;
         }
-        // mlat-server's dof rule (mlattrack: `elapsed > 30 and dof == 0:
-        // continue`): a 4-receiver fixed-altitude solve has zero redundancy,
-        // so no residual can catch a bad observation. Allow it only when the
-        // track is starved. Measured on real data: zero-dof solves produced
-        // most of the ghosts and tail error (74 gross, p99 1.2 km).
-        if obs.len() == 4 && now_scaled - track.last_time_scaled < 30.0 {
-            self.stats_rejected += 1;
-            return;
-        }
+        // A 4-receiver solve fits 3 unknowns (lat, lon, t_tx; altitude is
+        // fixed) to 4 arrivals: one spare equation, too few to leave a bad
+        // receiver out (that needs 5). Measured on real data, such solves
+        // made most of the ghosts and tail error (74 gross, p99 1.2 km), so
+        // they were refused until the track had starved 30 s. On a sparse
+        // network most aircraft are heard by exactly 4 receivers, and that
+        // refusal froze them to one fix per 30 s.
+        // They are solved now and published only when they agree with the
+        // track (four_rx_consistent, below), or once the track has starved.
         let Some(&alt_ft) = self.alts_ft.get(&icao) else {
             return; // no altitude yet (DF11-only so far) — wait for a DF4
         };
@@ -852,6 +885,13 @@ impl State {
                 let elapsed = now_scaled - track.last_time_scaled;
                 if track.last_pos.is_some()
                     && elapsed / 20.0 < sol.err_est_m / Self::THROTTLE_SCALE_M
+                {
+                    self.stats_rejected += 1;
+                    return;
+                }
+                if obs.len() == 4
+                    && elapsed < 30.0
+                    && !self.four_rx_consistent(icao, &sol, now_scaled)
                 {
                     self.stats_rejected += 1;
                     return;
@@ -1491,5 +1531,72 @@ mod tests {
             map_position(&rx_info("alice")),
             map_position(&rx_info("alice"))
         );
+    }
+
+    /// An eastbound airliner (230 m/s at 55° N) with two published fixes
+    /// 5 s apart; the next 4-receiver fix comes 5 s after the last.
+    fn four_rx_track(fixes: usize) -> (State, Icao) {
+        let mut st = state();
+        let icao = Icao(0x4CAD2A);
+        let a = st.ac_log.entry(icao).or_default();
+        let at = |t: f64| Geodetic {
+            lat_deg: 55.0,
+            lon_deg: 15.0 + 0.003602 * (t - 100.0),
+            alt_m: 10_973.0,
+        };
+        if fixes >= 2 {
+            a.prev_fix = Some((100.0, at(100.0)));
+        }
+        if fixes >= 1 {
+            a.last_fix = Some((105.0, at(105.0)));
+        }
+        (st, icao)
+    }
+
+    fn fix_at(lat_deg: f64, lon_deg: f64, err_est_m: f64) -> solve::Solution {
+        solve::Solution {
+            pos: Geodetic {
+                lat_deg,
+                lon_deg,
+                alt_m: 10_973.0,
+            },
+            rms_s: 0.2e-6,
+            err_est_m,
+            iterations: 4,
+            t_tx: 0.0,
+            residuals_s: vec![],
+        }
+    }
+
+    #[test]
+    fn a_four_receiver_fix_on_the_track_is_published() {
+        let (st, icao) = four_rx_track(2);
+        // truth at t=110 is lon 15.03602; 200 m off it to the north
+        let fix = fix_at(55.0 + 200.0 / 111_320.0, 15.03602, 150.0);
+        assert!(st.four_rx_consistent(icao, &fix, 110.0));
+    }
+
+    #[test]
+    fn a_four_receiver_fix_in_a_gentle_turn_is_published() {
+        let (st, icao) = four_rx_track(2);
+        // 700 m off the straight line after 5 s: gate 500 + 5 × 60 = 800 m
+        let fix = fix_at(55.0 + 700.0 / 111_320.0, 15.03602, 150.0);
+        assert!(st.four_rx_consistent(icao, &fix, 110.0));
+    }
+
+    #[test]
+    fn a_four_receiver_ghost_off_the_track_is_refused() {
+        let (st, icao) = four_rx_track(2);
+        let fix = fix_at(55.0 + 3_000.0 / 111_320.0, 15.03602, 150.0);
+        assert!(!st.four_rx_consistent(icao, &fix, 110.0));
+    }
+
+    #[test]
+    fn a_four_receiver_fix_without_a_velocity_waits() {
+        for fixes in [0, 1] {
+            let (st, icao) = four_rx_track(fixes);
+            let fix = fix_at(55.0, 15.03602, 150.0);
+            assert!(!st.four_rx_consistent(icao, &fix, 110.0), "{fixes} fixes");
+        }
     }
 }
