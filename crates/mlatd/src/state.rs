@@ -46,6 +46,11 @@ struct Track {
     last_pos: Option<Geodetic>,
     last_time_scaled: f64,
     last_attempt_scaled: f64,
+    /// Last attempt at a track-gated 4-receiver solve (four_rx_consistent).
+    /// Kept apart from `last_attempt_scaled` so a refused 4-receiver fix
+    /// does not hold back the next frame, which more receivers may have
+    /// heard.
+    last_gated_attempt_scaled: f64,
     /// Consecutive speed-gate rejections. A long run means the track itself
     /// is wrong (locked onto an early bad fix); the gate then resets the
     /// track instead of suppressing a correct stream.
@@ -331,6 +336,14 @@ impl State {
         let rx = r.idx;
         self.alive[rx] = false;
         self.pairs.retain(|(a, b), _| *a != rx && *b != rx);
+        self.forget_pending(rx);
+        for a in self.ac_log.values_mut() {
+            a.rx_mlat.remove(&rx);
+            a.rx_sync.remove(&rx);
+        }
+        let log = &mut self.rx_log[rx];
+        log.sync = HashMap::new();
+        log.mlat = HashMap::new();
         self.stamp_offset.remove(&rx);
         if self.by_user.get(&self.receivers[rx].user) == Some(&rx) {
             self.by_user.remove(&self.receivers[rx].user);
@@ -347,6 +360,21 @@ impl State {
             return;
         }
         self.pairs.retain(|(a, b), _| *a != r.idx && *b != r.idx);
+        self.forget_pending(r.idx);
+    }
+
+    /// Drop a slot's in-flight timestamps (sync points up to 4 s, groups
+    /// for one window). They are in a clock that no longer holds: after a
+    /// clock reset, or after a disconnect, when a reconnect of the same
+    /// user takes the slot straight back and the liveness check alone
+    /// would pair the old times with the new clock.
+    fn forget_pending(&mut self, rx: usize) {
+        for sp in self.syncpoints.values_mut() {
+            sp.reporters.retain(|r| r.0 != rx);
+        }
+        for g in self.groups.values_mut() {
+            g.entries.retain(|e| e.0 != rx);
+        }
     }
 
     /// A sync message from receiver `rx`: the same DF17 even/odd pair seen by
@@ -687,25 +715,39 @@ impl State {
         const GATE_SIGMAS: f64 = 3.0;
         const GATE_FLOOR_M: f64 = 500.0;
         const TURN_SLACK_MPS: f64 = 60.0;
-        let Some(a) = self.ac_log.get(&icao) else {
+        let Some((predicted, horizon)) = self.four_rx_prediction(icao, sol.pos.alt_m, now) else {
             return false;
-        };
-        let (Some((t1, p1)), Some((t0, p0))) = (a.last_fix, a.prev_fix) else {
-            return false;
-        };
-        let span = t1 - t0;
-        let horizon = now - t1;
-        if !(1.0..=60.0).contains(&span) || !(0.0..30.0).contains(&horizon) {
-            return false;
-        }
-        let k = horizon / span;
-        let predicted = Geodetic {
-            lat_deg: p1.lat_deg + (p1.lat_deg - p0.lat_deg) * k,
-            lon_deg: p1.lon_deg + (p1.lon_deg - p0.lon_deg) * k,
-            alt_m: sol.pos.alt_m,
         };
         let gate = (GATE_SIGMAS * sol.err_est_m).max(GATE_FLOOR_M) + TURN_SLACK_MPS * horizon;
         sol.pos.haversine_m(&predicted) <= gate
+    }
+
+    /// Where the track puts the aircraft at `now` (and how far ahead that
+    /// is, s), from its last two published fixes; None when they give no
+    /// credible velocity.
+    fn four_rx_prediction(&self, icao: Icao, alt_m: f64, now: f64) -> Option<(Geodetic, f64)> {
+        let a = self.ac_log.get(&icao)?;
+        let ((t1, p1), (t0, p0)) = (a.last_fix?, a.prev_fix?);
+        let span = t1 - t0;
+        let horizon = now - t1;
+        if !(1.0..=60.0).contains(&span) || !(0.0..30.0).contains(&horizon) {
+            return None;
+        }
+        // A velocity faster than the speed gate allows is itself a ghost.
+        if p1.haversine_m(&p0) / span > 400.0 {
+            return None;
+        }
+        let k = horizon / span;
+        // Longitude step taken the short way round, so a track across the
+        // antimeridian extrapolates along itself, not across the globe.
+        let dlon = (p1.lon_deg - p0.lon_deg + 540.0).rem_euclid(360.0) - 180.0;
+        let lon = (p1.lon_deg + dlon * k + 540.0).rem_euclid(360.0) - 180.0;
+        let predicted = Geodetic {
+            lat_deg: p1.lat_deg + (p1.lat_deg - p0.lat_deg) * k,
+            lon_deg: lon,
+            alt_m,
+        };
+        Some((predicted, horizon))
     }
 
     /// Connection uids of a group's live receivers in range of the fix:
@@ -763,6 +805,7 @@ impl State {
         let mut obs: Vec<Observation> = Vec::new();
         let mut users: Vec<String> = Vec::new();
         let mut rx_ids: Vec<usize> = Vec::new();
+        let mut benched: Vec<(usize, f64)> = Vec::new();
         let mut stamp = f64::INFINITY;
         for &(rx, t, sigma, at_scaled) in cluster {
             if !seen.insert(rx) || !self.alive[rx] {
@@ -773,7 +816,8 @@ impl State {
             // effective range is modeled too long — advance its clock reading.
             let b = self.rx_bias[rx];
             if b.n >= QUARANTINE_MIN_N && b.mad_s > QUARANTINE_MAD_S {
-                continue; // quarantined: residual scatter says untrustworthy
+                benched.push((rx, t)); // quarantined: scored, not used
+                continue;
             }
             obs.push(Observation {
                 rx: self.receivers[rx].ecef,
@@ -829,7 +873,16 @@ impl State {
         }
         let now_scaled = self.scaled_now();
         let track = *self.tracks.entry(icao).or_default();
-        if now_scaled - track.last_attempt_scaled < Self::RESOLVE_BACKOFF_S {
+        // A 4-receiver solve on a live track is gated by the track (below).
+        let gated = obs.len() == 4 && now_scaled - track.last_time_scaled < 30.0;
+        let last_attempt = if gated {
+            track
+                .last_attempt_scaled
+                .max(track.last_gated_attempt_scaled)
+        } else {
+            track.last_attempt_scaled
+        };
+        if now_scaled - last_attempt < Self::RESOLVE_BACKOFF_S {
             return;
         }
         // A 4-receiver solve fits 3 unknowns (lat, lon, t_tx; altitude is
@@ -841,14 +894,27 @@ impl State {
         // refusal froze them to one fix per 30 s.
         // They are solved now and published only when they agree with the
         // track (four_rx_consistent, below), or once the track has starved.
+        // Without a prediction there is nothing to agree with: refused
+        // before the solve, as in 0.4.5.
+        // A gated attempt stamps its own backoff: were it refused, the
+        // shared one would hold back the aircraft's next frame (0.4.6 lost
+        // 5-receiver fixes that way).
         let Some(&alt_ft) = self.alts_ft.get(&icao) else {
             return; // no altitude yet (DF11-only so far) — wait for a DF4
         };
         let alt_m = alt_ft as f64 * 0.3048;
-        self.tracks
-            .get_mut(&icao)
-            .expect("entry above")
-            .last_attempt_scaled = now_scaled;
+        if gated && self.four_rx_prediction(icao, alt_m, now_scaled).is_none() {
+            self.stats_rejected += 1;
+            return;
+        }
+        {
+            let t = self.tracks.get_mut(&icao).expect("entry above");
+            if gated {
+                t.last_gated_attempt_scaled = now_scaled;
+            } else {
+                t.last_attempt_scaled = now_scaled;
+            }
+        }
         // Warm start from the last accepted fix when fresh (< 60 s), as in
         // mlat-server; else start from the receivers' centroid.
         let init = match track.last_pos {
@@ -856,21 +922,21 @@ impl State {
             _ => {
                 // Centroid of the observing receivers, by slot. A lookup by
                 // user name scanned every slot per member and could land on
-                // a freed slot that once held the same name.
+                // a freed slot that once held the same name. Averaged in
+                // ECEF: a mean of longitudes across the antimeridian lands on
+                // the far side of the earth.
                 let n = rx_ids.len() as f64;
-                Geodetic {
-                    lat_deg: rx_ids
-                        .iter()
-                        .map(|&i| self.receivers[i].geo.lat_deg)
-                        .sum::<f64>()
-                        / n,
-                    lon_deg: rx_ids
-                        .iter()
-                        .map(|&i| self.receivers[i].geo.lon_deg)
-                        .sum::<f64>()
-                        / n,
-                    alt_m,
+                let (x, y, z) = rx_ids.iter().fold((0.0, 0.0, 0.0), |(x, y, z), &i| {
+                    let e = self.receivers[i].ecef;
+                    (x + e.x, y + e.y, z + e.z)
+                });
+                let c = Ecef {
+                    x: x / n,
+                    y: y / n,
+                    z: z / n,
                 }
+                .to_geodetic();
+                Geodetic { alt_m, ..c }
             }
         };
         let is_df17_group = cluster_is_df17;
@@ -889,10 +955,7 @@ impl State {
                     self.stats_rejected += 1;
                     return;
                 }
-                if obs.len() == 4
-                    && elapsed < 30.0
-                    && !self.four_rx_consistent(icao, &sol, now_scaled)
-                {
+                if gated && !self.four_rx_consistent(icao, &sol, now_scaled) {
                     self.stats_rejected += 1;
                     return;
                 }
@@ -911,9 +974,30 @@ impl State {
                         if t.speed_rejects >= 5 {
                             t.last_pos = None;
                             t.speed_rejects = 0;
+                            // The published fixes the track was built on go
+                            // too: a velocity from a bad fix to the next good
+                            // one would steer the 4-receiver gate.
+                            if let Some(a) = self.ac_log.get_mut(&icao) {
+                                a.last_fix = None;
+                                a.prev_fix = None;
+                            }
                         }
                         self.stats_rejected += 1;
                         return;
+                    }
+                }
+                // A quarantined receiver keeps training against fixes made
+                // without it, so a recovered sensor re-admits itself. Only
+                // tight fixes: their own position error (≤ 150 m, 0.5 µs)
+                // must stay well under the 1.5 µs quarantine line.
+                if rx_ids.len() >= 5 && sol.err_est_m < 150.0 {
+                    let tx = Geodetic { alt_m, ..sol.pos }.to_ecef();
+                    for &(rx, t) in &benched {
+                        let b = &mut self.rx_bias[rx];
+                        let r =
+                            sol.t_tx + dist(&tx, &self.receivers[rx].ecef) / C_MPS - (t + b.bias_s);
+                        b.bias_s += 0.02 * r;
+                        b.mad_s += 0.02 * ((r - b.bias_s).abs() - b.mad_s);
                     }
                 }
                 // DF17 (self-truth) fixes are scored against the aircraft's
@@ -972,6 +1056,7 @@ impl State {
                 let t = self.tracks.get_mut(&icao).expect("entry above");
                 t.last_pos = Some(sol.pos);
                 t.last_time_scaled = now_scaled;
+                t.last_attempt_scaled = now_scaled; // a published fix is an attempt
                 t.speed_rejects = 0;
                 {
                     let a = self.ac_log.entry(icao).or_default();
@@ -1598,5 +1683,170 @@ mod tests {
             let fix = fix_at(55.0, 15.03602, 150.0);
             assert!(!st.four_rx_consistent(icao, &fix, 110.0), "{fixes} fixes");
         }
+    }
+
+    /// (receiver slot, arrival time, sigma, arrival stamp): solve_cluster's input.
+    type Cluster = Vec<(usize, f64, f64, f64)>;
+
+    /// Six receivers around Nantes and an aircraft at FL360 among them; the
+    /// cluster tuples carry exact arrival times in one clock.
+    fn solvable_sky() -> (State, Icao, Cluster) {
+        // A clock well past zero: a fresh track's attempt stamps are 0.
+        let mut st = State::new(0, 1.0, false, false, (1.8e9, Instant::now()));
+        let spots = [
+            (47.0, -1.5),
+            (47.5, -1.0),
+            (46.6, -0.9),
+            (47.3, -2.2),
+            (46.7, -2.0),
+            (47.6, -1.7),
+        ];
+        let truth = Geodetic {
+            lat_deg: 47.1,
+            lon_deg: -1.4,
+            alt_m: 36_000.0 * 0.3048,
+        };
+        let mut cluster = Vec::new();
+        for (i, (lat, lon)) in spots.iter().enumerate() {
+            let mut info = rx_info(&format!("rx{i}"));
+            info.geo = Geodetic {
+                lat_deg: *lat,
+                lon_deg: *lon,
+                alt_m: 40.0,
+            };
+            info.ecef = info.geo.to_ecef();
+            let r = st.add_receiver(info);
+            let t = 100.0 + dist(&truth.to_ecef(), &st.receivers[r.idx].ecef) / mb_core::C_MPS;
+            cluster.push((r.idx, t, 100e-9, st.scaled_now()));
+        }
+        let icao = Icao(0x3C6444);
+        st.alts_ft.insert(icao, 36_000);
+        st.ac_log.entry(icao).or_default().seen = st.scaled_now();
+        (st, icao, cluster)
+    }
+
+    #[test]
+    fn a_refused_four_receiver_fix_does_not_hold_back_the_next_frame() {
+        let (mut st, icao, cluster) = solvable_sky();
+        let now = st.scaled_now();
+        let truth = Geodetic {
+            lat_deg: 47.1,
+            lon_deg: -1.4,
+            alt_m: 0.0,
+        };
+        // A live track whose velocity points 20 km away: the 4-receiver fix
+        // at the truth disagrees with it and is refused.
+        st.tracks.insert(
+            icao,
+            Track {
+                last_pos: Some(truth),
+                last_time_scaled: now - 10.0,
+                ..Track::default()
+            },
+        );
+        let off = Geodetic {
+            lat_deg: 47.28,
+            ..truth
+        };
+        let a = st.ac_log.get_mut(&icao).unwrap();
+        a.prev_fix = Some((now - 15.0, off));
+        a.last_fix = Some((now - 10.0, off));
+        let members: Vec<usize> = cluster.iter().map(|c| c.0).collect();
+        st.solve_cluster(icao, false, 0, &cluster[..4], &members);
+        assert_eq!(st.stats_solved, 0, "the ghost-shaped 4-rx fix is refused");
+        // The next frame, heard by all six, comes well inside the backoff.
+        st.solve_cluster(icao, false, 0, &cluster, &members);
+        assert_eq!(st.stats_solved, 1, "the 6-rx fix is not blocked");
+    }
+
+    #[test]
+    fn four_receiver_attempts_still_back_off() {
+        let (mut st, icao, cluster) = solvable_sky();
+        let members: Vec<usize> = cluster.iter().map(|c| c.0).collect();
+        // First fix of a new aircraft: no track, the 4-rx fix is published.
+        st.solve_cluster(icao, false, 0, &cluster[..4], &members);
+        assert_eq!(st.stats_solved, 1);
+        // Straight after: gated, inside the backoff, not even attempted.
+        let rejected = st.stats_rejected;
+        st.solve_cluster(icao, false, 0, &cluster[..4], &members);
+        assert_eq!((st.stats_solved, st.stats_rejected), (1, rejected));
+    }
+
+    #[test]
+    fn a_track_across_the_antimeridian_predicts_along_itself() {
+        let mut st = state();
+        let icao = Icao(0x7C0001);
+        let a = st.ac_log.entry(icao).or_default();
+        let at = |lon_deg: f64| Geodetic {
+            lat_deg: 0.0,
+            lon_deg,
+            alt_m: 11_000.0,
+        };
+        a.prev_fix = Some((100.0, at(179.98)));
+        a.last_fix = Some((105.0, at(179.99)));
+        let fix = fix_at(0.0, -180.0, 150.0);
+        let fix = solve::Solution {
+            pos: Geodetic {
+                lat_deg: 0.0,
+                ..fix.pos
+            },
+            ..fix
+        };
+        assert!(st.four_rx_consistent(icao, &fix, 110.0));
+    }
+
+    #[test]
+    fn a_quarantined_receiver_that_recovers_is_readmitted() {
+        let (mut st, icao, cluster) = solvable_sky();
+        let members: Vec<usize> = cluster.iter().map(|c| c.0).collect();
+        let bad = cluster[5].0;
+        st.rx_bias[bad] = RxBias {
+            bias_s: 0.0,
+            mad_s: 3e-6,
+            n: 100,
+        };
+        // Its timing is clean again; fixes from the other five score it.
+        for _ in 0..100 {
+            st.tracks.remove(&icao);
+            st.solve_cluster(icao, false, 0, &cluster, &members);
+        }
+        assert!(
+            st.rx_bias[bad].mad_s < QUARANTINE_MAD_S,
+            "{}",
+            st.rx_bias[bad].mad_s
+        );
+    }
+
+    #[test]
+    fn a_reconnect_forgets_the_old_clocks_pending_times() {
+        let mut s = state();
+        let a = s.add_receiver(rx_info("a"));
+        let b = s.add_receiver(rx_info("b"));
+        s.syncpoints.insert(
+            ("e".into(), "o".into()),
+            SyncPoint {
+                created: Instant::now(),
+                reporters: vec![(a.idx, 1.0, 1.1), (b.idx, 2.0, 2.1)],
+            },
+        );
+        let b2 = s.add_receiver(rx_info("b"));
+        assert_eq!(b2.idx, b.idx, "same slot, new clock");
+        let sp = &s.syncpoints[&("e".to_string(), "o".to_string())];
+        assert_eq!(sp.reporters, vec![(a.idx, 1.0, 1.1)]);
+    }
+
+    #[test]
+    fn a_track_faster_than_an_aircraft_predicts_nothing() {
+        let mut st = state();
+        let icao = Icao(0x4CAD2B);
+        let a = st.ac_log.entry(icao).or_default();
+        let at = |lon_deg: f64| Geodetic {
+            lat_deg: 55.0,
+            lon_deg,
+            alt_m: 11_000.0,
+        };
+        a.prev_fix = Some((100.0, at(15.0)));
+        a.last_fix = Some((105.0, at(15.8))); // 51 km in 5 s
+        assert!(st.four_rx_prediction(icao, 11_000.0, 110.0).is_none());
     }
 }

@@ -86,14 +86,12 @@ pub fn solve(obs: &[Observation], alt_m: f64, init: Geodetic) -> Option<Solution
     let t_min = obs.iter().map(|o| o.t_s).fold(f64::INFINITY, f64::min);
     let mut t_tx = t_min - 200e3 / C_MPS;
 
-    let mut rms = f64::INFINITY;
     let mut iters = 0;
     for it in 0..MAX_ITER {
         iters = it + 1;
-        // Unweighted RMS is the physical-credibility gate; the step uses
-        // weighted residuals so precise receivers pull harder (solver.py).
-        let ru = residuals(obs, lat, lon, alt_m, t_tx);
-        rms = (ru.iter().map(|x| x * x).sum::<f64>() / ru.len() as f64).sqrt();
+        // The step uses weighted residuals so precise receivers pull harder
+        // (solver.py); the unweighted RMS after the loop is the
+        // physical-credibility gate.
         let r = residuals_w(obs, lat, lon, alt_m, t_tx);
 
         // Numeric Jacobian. Step sizes: ~1 m in position, 0.1 µs in time.
@@ -135,15 +133,25 @@ pub fn solve(obs: &[Observation], alt_m: f64, init: Geodetic) -> Option<Solution
             break;
         }
     }
-    if !lat.is_finite() || !lon.is_finite() || rms > MAX_RMS_S {
+    if !lat.is_finite() || !lon.is_finite() || lat.abs() > 90.0 {
         return None;
     }
+    // The loop measures the residual before each step, so a run that ends
+    // on its iteration cap has never checked where its last step (up to a
+    // degree) landed. The gate reads the returned position.
+    let final_resid = residuals(obs, lat, lon, alt_m, t_tx);
+    let rms = (final_resid.iter().map(|x| x * x).sum::<f64>() / final_resid.len() as f64).sqrt();
+    if rms > MAX_RMS_S {
+        return None;
+    }
+    // Longitude leaves the solve unwrapped (a warm start at 179.99° can step
+    // past 180°); published positions stay in [-180, 180).
+    let lon = (lon + 540.0).rem_euclid(360.0) - 180.0;
 
     // Error estimate from the final weighted normal matrix: cov = σ²(JᵀJ)⁻¹
     // with σ² from the weighted residuals. Lat/lon variances → meters.
     // If the matrix does not invert, the fix is suspect; mlat-server drops
     // those (mlattrack.py "this result is suspect") and this solver does too.
-    let final_resid = residuals(obs, lat, lon, alt_m, t_tx);
     let r = residuals_w(obs, lat, lon, alt_m, t_tx);
     let dof = (obs.len() as f64 - 3.0).max(1.0);
     let sigma2 = r.iter().map(|x| x * x).sum::<f64>() / dof;
