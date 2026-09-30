@@ -94,6 +94,11 @@ pub fn global_decode_airborne(
     if rlat_o >= 270.0 {
         rlat_o -= 360.0;
     }
+    // A CRC-valid pair can still decode past a pole (90..270 lands here);
+    // nl() is 1 on both sides, so the zone test below would pass it.
+    if rlat_e.abs() > 90.0 || rlat_o.abs() > 90.0 {
+        return None;
+    }
     if nl(rlat_e) != nl(rlat_o) {
         return None; // NL boundary straddle: pair unusable
     }
