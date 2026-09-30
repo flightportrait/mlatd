@@ -18,6 +18,17 @@ mod state;
 mod track;
 mod traffic;
 
+// jemalloc on glibc Linux (the Docker image, source builds). glibc keeps
+// a heap per thread and seldom trims them, and this workload allocates
+// frames, zlib states and JSON on one tokio worker and frees them on
+// another: an operator measured RSS past 1 GB with glibc and under 300 MB
+// with jemalloc, same version, same traffic. jemalloc returns freed pages
+// on a decay timer. The static musl release binaries keep musl's
+// allocator, which has no per-thread heaps and gives memory back.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[global_allocator]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use anyhow::{Context, Result};
 use clap::Parser;
 use mb_proto::framing::ZlibFrameDecoder;

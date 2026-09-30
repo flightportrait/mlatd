@@ -34,6 +34,8 @@ flate2 = "1"            # zlib framing (mlat-client "zlib"/"zlib2" compression)
 clap = { version = "4", features = ["derive"] }
 sha2 = "0.10"
 hex = "0.4"
+# mlatd's allocator on glibc Linux; see main.rs.
+tikv-jemallocator = "0.6"
 
 [profile.release]
 debug = true            # keep symbols; profiling a live server wants them
