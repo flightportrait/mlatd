@@ -17,6 +17,10 @@ const SYNC_IDLE_S: f64 = 30.0;
 /// A stopped aircraft may be requested again after this long, and only
 /// when the sync set has room.
 const SUPPRESS_S: f64 = 60.0;
+/// Most aircraft one connection may have requested at once. A receiver
+/// hears hundreds; the client reports each one lost when it fades. The
+/// cap bounds what a client that never does (or offers junk) can pin.
+const MAX_REQUESTED: usize = 20_000;
 
 pub struct Traffic {
     cap: usize,
@@ -51,6 +55,12 @@ impl Traffic {
     /// it should be started now; false if it already is, or if it was
     /// stopped for the cap and there is no room yet.
     pub fn offered(&mut self, icao: &str, now: f64) -> bool {
+        if icao.len() != 6 || !icao.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return false; // not an ICAO address: nothing to ask for
+        }
+        if self.requested.len() >= MAX_REQUESTED && !self.requested.contains(icao) {
+            return false;
+        }
         if let Some(&since) = self.suppressed.get(icao) {
             if now - since < SUPPRESS_S || !self.has_room(now) {
                 return false;
@@ -76,6 +86,8 @@ impl Traffic {
             return true;
         }
         self.requested.remove(icao);
+        // Stopped aircraft the client never offers again would stay here.
+        self.suppressed.retain(|_, t| now - *t < 10.0 * SUPPRESS_S);
         self.suppressed.insert(icao.to_string(), now);
         false
     }
@@ -107,28 +119,28 @@ mod tests {
     #[test]
     fn caps_sync_aircraft_and_lets_them_rotate() {
         let mut t = Traffic::new(2);
-        for a in ["a1", "a2", "a3"] {
+        for a in ["aa0001", "aa0002", "aa0003"] {
             assert!(t.offered(a, 0.0));
         }
-        assert!(t.on_sync("a1", 1.0));
-        assert!(t.on_sync("a2", 1.0));
-        assert!(!t.on_sync("a3", 1.0), "third ADS-B aircraft is stopped");
-        assert!(!t.offered("a3", 2.0), "not re-requested while full");
+        assert!(t.on_sync("aa0001", 1.0));
+        assert!(t.on_sync("aa0002", 1.0));
+        assert!(!t.on_sync("aa0003", 1.0), "third ADS-B aircraft is stopped");
+        assert!(!t.offered("aa0003", 2.0), "not re-requested while full");
         // a1 goes quiet: room again, but a3 is still in its suppress window.
-        assert!(!t.offered("a3", 40.0));
-        assert!(t.offered("a3", 61.0), "re-requested once there is room");
-        assert!(t.on_sync("a3", 62.0));
+        assert!(!t.offered("aa0003", 40.0));
+        assert!(t.offered("aa0003", 61.0), "re-requested once there is room");
+        assert!(t.on_sync("aa0003", 62.0));
     }
 
     #[test]
     fn mode_s_only_aircraft_are_never_capped() {
         let mut t = Traffic::new(1);
-        assert!(t.offered("m1", 0.0));
-        assert!(t.offered("m2", 0.0));
-        assert!(t.on_sync("a1", 0.0));
-        assert!(!t.on_sync("a2", 0.0));
+        assert!(t.offered("bb0001", 0.0));
+        assert!(t.offered("bb0002", 0.0));
+        assert!(t.on_sync("aa0001", 0.0));
+        assert!(!t.on_sync("aa0002", 0.0));
         assert!(
-            t.offered("m3", 0.0),
+            t.offered("bb0003", 0.0),
             "no sync ever seen: not an ADS-B cap case"
         );
     }
@@ -153,5 +165,18 @@ mod tests {
         );
         assert_eq!(adsb_icao("5d3c6444aabbcc"), None);
         assert_eq!(adsb_icao("203c6444580f0e0c1e9f2b6a5b1c"), None);
+    }
+
+    #[test]
+    fn junk_offers_are_refused_and_the_requested_set_is_bounded() {
+        let mut t = Traffic::new(0);
+        assert!(!t.offered("not-an-icao", 0.0));
+        assert!(!t.offered("abcdefg", 0.0));
+        for i in 0..MAX_REQUESTED {
+            assert!(t.offered(&format!("{i:06x}"), 0.0));
+        }
+        assert!(!t.offered("ffffff", 0.0), "full");
+        t.lost("000000");
+        assert!(t.offered("ffffff", 0.0), "a lost aircraft makes room");
     }
 }

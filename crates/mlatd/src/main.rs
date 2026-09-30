@@ -567,7 +567,7 @@ async fn handle_client(
     // The router counts the receiver at claim time; teardown decrements.
     let (_shard_idx, shard) = router.shard_for(lat, lon);
     let (otx, orx) = oneshot::channel();
-    shard
+    let added = shard
         .tx
         .send(ShardMsg::AddReceiver(
             ReceiverInfo {
@@ -588,8 +588,18 @@ async fn handle_client(
             otx,
         ))
         .await
-        .map_err(|_| anyhow::anyhow!("shard gone"))?;
-    let rx = orx.await.map_err(|_| anyhow::anyhow!("shard gone"))?;
+        .map_err(|_| anyhow::anyhow!("shard gone"));
+    let rx = match added {
+        Ok(()) => orx.await.map_err(|_| anyhow::anyhow!("shard gone")),
+        Err(e) => Err(e),
+    };
+    let rx = match rx {
+        Ok(rx) => rx,
+        Err(e) => {
+            release(&shard, None).await;
+            return Err(e);
+        }
+    };
     let wants_results = client_results && hs["return_results"].as_bool().unwrap_or(false);
     let wants_stats = hs["return_stats"].as_bool().unwrap_or(false);
     // A real mlat-client sends no traffic until asked: selective traffic is
@@ -602,7 +612,10 @@ async fn handle_client(
          \"return_stats\":{wants_stats},\
          \"motd\":\"FlightPortrait network MLAT (mlatd)\"}}\n"
     );
-    wr.write_all(reply.as_bytes()).await?;
+    if let Err(e) = wr.write_all(reply.as_bytes()).await {
+        release(&shard, Some(rx)).await;
+        return Err(e.into());
+    }
     println!("mlatd: {user} connected ({clock_type}, {negotiated})");
 
     // Single writer task: heartbeats and (if subscribed) result messages
@@ -686,15 +699,48 @@ async fn handle_client(
     });
 
     // ---- message loop ----------------------------------------------------
+    // Heartbeats, stats pushes and the eviction check run in their own
+    // task, so the reader below is a plain sequence of reads. Timers raced
+    // against a read used to cancel it mid-line or mid-frame (the bytes
+    // already taken were lost, and a split frame header desynced zlib), and
+    // restarted the idle deadline on every tick, so it never fired: a
+    // feeder whose link died without a FIN kept its socket and both zlib
+    // states until the kernel gave up on the heartbeat writes, and a frame
+    // header with no body behind it held them forever.
     // A connection silent for 5 minutes is dead (real clients heartbeat
     // every 30 s); reap it so churned feeders do not accumulate.
     const IDLE: Duration = Duration::from_secs(300);
-    let mut hb = tokio::time::interval(hb_real);
-    hb.tick().await; // consume immediate first tick
-                     // Per-receiver stats push, every 15 s when the client asked for it
-                     // (mlat-client always does; its --stats-json file is built from this).
-    let mut stats_tick = tokio::time::interval(Duration::from_secs(15));
-    stats_tick.tick().await;
+    let (evict_tx, mut evicted) = oneshot::channel::<()>();
+    let ticker = {
+        let shard = shard.clone();
+        let tx_line = tx_line.clone();
+        tokio::spawn(async move {
+            // Both intervals skip their immediate first tick. Stats go every
+            // 15 s (mlat-client always asks; its --stats-json file is built
+            // from them), and the same request tells whether the shard
+            // still holds this receiver.
+            let mut hb = tokio::time::interval(hb_real);
+            hb.tick().await;
+            let mut stats_tick = tokio::time::interval(Duration::from_secs(15));
+            stats_tick.tick().await;
+            loop {
+                tokio::select! {
+                    _ = hb.tick() => {
+                        // try_send: a peer that stopped reading fills the
+                        // writer's queue; heartbeats are not worth waiting on.
+                        let st = scaled_now(conn_t0_unix, conn_t0, time_scale);
+                        let _ = tx_line.try_send(format!("{{\"heartbeat\":{{\"server_time\":{st:.3}}}}}\n"));
+                    }
+                    _ = stats_tick.tick() => {
+                        if !push_stats(&shard, rx, &tx_line, wants_stats).await {
+                            let _ = evict_tx.send(());
+                            return;
+                        }
+                    }
+                }
+            }
+        })
+    };
     let mut zdec = if negotiated == "none" {
         None
     } else {
@@ -702,58 +748,40 @@ async fn handle_client(
     };
     let mut traffic = traffic::Traffic::new(sync_cap);
     let res: Result<()> = async {
+        let mut line = Vec::new();
         loop {
+            // Eviction and idleness both end the connection, so the read
+            // they cancel is not needed any more.
             match &mut zdec {
                 None => {
-                    let mut line = Vec::new();
+                    line.clear();
                     let mut limited = (&mut rd).take(256 * 1024);
-                    tokio::select! {
-                        _ = hb.tick() => {
-                            // try_send: a peer that stopped reading fills
-                            // the writer's queue, and an awaiting send here
-                            // would park the reader too, past the idle reaper.
-                            let st = scaled_now(conn_t0_unix, conn_t0, time_scale);
-                            let _ = tx_line.try_send(format!("{{\"heartbeat\":{{\"server_time\":{st:.3}}}}}\n"));
-                        }
-                        _ = stats_tick.tick(), if wants_stats => {
-                            push_stats(&shard, rx, &tx_line).await;
-                        }
+                    let n = tokio::select! {
+                        _ = &mut evicted => anyhow::bail!("{user}: replaced by a newer connection"),
                         r = tokio::time::timeout(IDLE, limited.read_until(b'\n', &mut line)) => {
-                            let n = r.context("idle for 5 minutes")??;
-                            if n == 0 { break }
-                            if line.last() != Some(&b'\n') {
-                                anyhow::bail!("line over 256 KiB");
-                            }
-                            let now_s = scaled_now(conn_t0_unix, conn_t0, time_scale);
-                            process_line_tx(&shard, rx, &line, Some(&tx_line), &mut traffic, now_s).await;
+                            r.context("idle for 5 minutes")??
                         }
+                    };
+                    if n == 0 {
+                        break;
                     }
+                    if line.last() != Some(&b'\n') {
+                        anyhow::bail!("line over 256 KiB");
+                    }
+                    let now_s = scaled_now(conn_t0_unix, conn_t0, time_scale);
+                    process_line_tx(&shard, rx, &line, Some(&tx_line), &mut traffic, now_s).await;
                 }
                 Some(dec) => {
                     // Framed: 2-byte BE length + zlib payload with persistent
                     // dictionary state (mb-proto framing; the same code the
                     // capture generator uses, exercised from the other side).
-                    let mut lenb = [0u8; 2];
-                    tokio::select! {
-                        _ = hb.tick() => {
-                            let st = scaled_now(conn_t0_unix, conn_t0, time_scale);
-                            let _ = tx_line.try_send(format!("{{\"heartbeat\":{{\"server_time\":{st:.3}}}}}\n"));
-                            continue
+                    let payload = tokio::select! {
+                        _ = &mut evicted => anyhow::bail!("{user}: replaced by a newer connection"),
+                        r = tokio::time::timeout(IDLE, read_zlib_frame(&mut rd)) => {
+                            r.context("idle for 5 minutes")?
                         }
-                        _ = stats_tick.tick(), if wants_stats => {
-                            push_stats(&shard, rx, &tx_line).await;
-                            continue
-                        }
-                        r = tokio::time::timeout(IDLE, rd.read_exact(&mut lenb)) => {
-                            if r.context("idle for 5 minutes")?.is_err() { break }
-                        }
-                    }
-                    let want = u16::from_be_bytes(lenb) as usize;
-                    let mut payload = vec![0u8; 2 + want];
-                    payload[..2].copy_from_slice(&lenb);
-                    if rd.read_exact(&mut payload[2..]).await.is_err() {
-                        break;
-                    }
+                    };
+                    let Some(payload) = payload else { break };
                     let Ok(chunk) = dec.decode_frame(&payload) else {
                         anyhow::bail!("zlib frame decode failed for {user}");
                     };
@@ -772,12 +800,12 @@ async fn handle_client(
     .await;
     // Free the slot on every exit path; the generation guard makes this
     // safe against a same-user reconnect that already took the slot over.
-    let _ = shard.tx.send(ShardMsg::RemoveReceiver(rx)).await;
-    shard
-        .receivers
-        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-    if let Some(f) = &forwarder {
+    release(&shard, Some(rx)).await;
+    ticker.abort();
+    let _ = ticker.await;
+    if let Some(f) = forwarder {
         f.abort();
+        let _ = f.await;
     }
     drop(tx_line);
     // Flush what the writer still holds, but not for long: a peer that
@@ -794,12 +822,16 @@ async fn handle_client(
     res
 }
 
-/// One stats push: mlat-server's per-receiver triple, same field names.
+/// One stats request: mlat-server's per-receiver triple, same field names,
+/// pushed to the client when it asked for stats. False when the shard no
+/// longer holds this receiver: a newer connection of the same user took
+/// the slot, and this one only looks alive to its feeder.
 async fn push_stats(
     shard: &Arc<ShardHandle>,
     rx: crate::state::RxRef,
     tx_line: &tokio::sync::mpsc::Sender<String>,
-) {
+    send: bool,
+) -> bool {
     let (otx, orx) = oneshot::channel();
     if shard
         .tx
@@ -807,14 +839,40 @@ async fn push_stats(
         .await
         .is_err()
     {
-        return;
+        return false;
     }
-    if let Ok(Some((peers, outlier_percent, quarantined))) = orx.await {
+    let Ok(Some((peers, outlier_percent, quarantined))) = orx.await else {
+        return false;
+    };
+    if send {
         let bad_sync_timeout = if quarantined { 60 } else { 0 };
         let _ = tx_line.try_send(format!(
             "{{\"stats\":{{\"peer_count\":{peers},\"bad_sync_timeout\":{bad_sync_timeout},\"outlier_percent\":{outlier_percent:.1}}}}}\n"
         ));
     }
+    true
+}
+
+/// Give back what `Router::shard_for` counted and, once added, the slot.
+async fn release(shard: &Arc<ShardHandle>, rx: Option<crate::state::RxRef>) {
+    if let Some(rx) = rx {
+        let _ = shard.tx.send(ShardMsg::RemoveReceiver(rx)).await;
+    }
+    shard
+        .receivers
+        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// One zlib frame, length header included; None at end of stream or on a
+/// read error. Not cancel-safe: the caller only cancels it to close.
+async fn read_zlib_frame<R: tokio::io::AsyncRead + Unpin>(rd: &mut R) -> Option<Vec<u8>> {
+    let mut lenb = [0u8; 2];
+    rd.read_exact(&mut lenb).await.ok()?;
+    let want = u16::from_be_bytes(lenb) as usize;
+    let mut payload = vec![0u8; 2 + want];
+    payload[..2].copy_from_slice(&lenb);
+    rd.read_exact(&mut payload[2..]).await.ok()?;
+    Some(payload)
 }
 
 /// seen/rate_report trigger start_sending for aircraft not yet requested on
