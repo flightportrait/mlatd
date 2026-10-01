@@ -23,6 +23,12 @@ pub struct Solution {
     /// mlat-server's var_est = trace(cov) (mlattrack.py), horizontal block
     /// only. This value gates publication.
     pub err_est_m: f64,
+    /// Horizontal error the geometry and the stated timing errors allow,
+    /// m: the same covariance, not rescaled by the fit's own residuals. A
+    /// 4-receiver fit has one spare equation, so its rescaled estimate can
+    /// land anywhere (a fix 510 m out estimated itself at 1 m); this one
+    /// does not depend on that one residual.
+    pub err_geom_m: f64,
     /// Kept for logging/tests; not part of the CSV contract.
     #[allow(dead_code)]
     pub iterations: u32,
@@ -159,9 +165,10 @@ pub fn solve(obs: &[Observation], alt_m: f64, init: Geodetic) -> Option<Solution
     let cov = invert3(&jtj)?;
     let m_per_deg_lat = 111_320.0;
     let m_per_deg_lon = 111_320.0 * lat.to_radians().cos().max(0.05);
-    let var_m2 = sigma2
-        * (cov[0][0] * m_per_deg_lat * m_per_deg_lat + cov[1][1] * m_per_deg_lon * m_per_deg_lon);
-    let err_est_m = var_m2.abs().sqrt();
+    let geom_m2 =
+        cov[0][0] * m_per_deg_lat * m_per_deg_lat + cov[1][1] * m_per_deg_lon * m_per_deg_lon;
+    let err_est_m = (sigma2 * geom_m2).abs().sqrt();
+    let err_geom_m = geom_m2.abs().sqrt();
 
     Some(Solution {
         pos: Geodetic {
@@ -171,6 +178,7 @@ pub fn solve(obs: &[Observation], alt_m: f64, init: Geodetic) -> Option<Solution
         },
         rms_s: rms,
         err_est_m,
+        err_geom_m,
         iterations: iters,
         t_tx,
         residuals_s: final_resid,
