@@ -578,6 +578,9 @@ async fn handle_client(
     // The router counts the receiver at claim time; teardown decrements.
     let (_shard_idx, shard) = router.shard_for(lat, lon);
     let (otx, orx) = oneshot::channel();
+    let last_read = Arc::new(std::sync::atomic::AtomicU64::new(
+        scaled_now(conn_t0_unix, conn_t0, time_scale).to_bits(),
+    ));
     let added = shard
         .tx
         .send(ShardMsg::AddReceiver(
@@ -595,6 +598,7 @@ async fn handle_client(
                 gps,
                 // Effective timing error: clock jitter + pair-model slack.
                 jitter_s: if gps { 30e-9 } else { 150e-9 },
+                last_read: last_read.clone(),
             },
             otx,
         ))
@@ -605,7 +609,23 @@ async fn handle_client(
         Err(e) => Err(e),
     };
     let rx = match rx {
-        Ok(rx) => rx,
+        Ok(Some(rx)) => rx,
+        Ok(None) => {
+            // mlat-server's answer to a second connection of a connected
+            // user. The retry comes after the live window has run out, so
+            // a reconnect over a dead link gets in on it.
+            release(&shard, None).await;
+            let _ = wr
+                .write_all(
+                    format!(
+                        "{{\"deny\":[\"User {} is already connected\"],\"reconnect_in\":90}}\n",
+                        user.replace(['"', '\\'], "")
+                    )
+                    .as_bytes(),
+                )
+                .await;
+            anyhow::bail!("{user}: refused, already connected");
+        }
         Err(e) => {
             release(&shard, None).await;
             return Err(e);
@@ -780,6 +800,7 @@ async fn handle_client(
                         anyhow::bail!("line over 256 KiB");
                     }
                     let now_s = scaled_now(conn_t0_unix, conn_t0, time_scale);
+                    last_read.store(now_s.to_bits(), std::sync::atomic::Ordering::Relaxed);
                     process_line_tx(&shard, rx, &line, Some(&tx_line), &mut traffic, now_s).await;
                 }
                 Some(dec) => {
@@ -797,6 +818,7 @@ async fn handle_client(
                         anyhow::bail!("zlib frame decode failed for {user}");
                     };
                     let now_s = scaled_now(conn_t0_unix, conn_t0, time_scale);
+                    last_read.store(now_s.to_bits(), std::sync::atomic::Ordering::Relaxed);
                     for line in chunk.split(|b| *b == b'\n') {
                         if !line.is_empty() {
                             process_line_tx(&shard, rx, line, Some(&tx_line), &mut traffic, now_s)

@@ -23,7 +23,7 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
 pub enum ShardMsg {
-    AddReceiver(ReceiverInfo, oneshot::Sender<RxRef>),
+    AddReceiver(ReceiverInfo, oneshot::Sender<Option<RxRef>>),
     RemoveReceiver(RxRef),
     Sync {
         rx: RxRef,

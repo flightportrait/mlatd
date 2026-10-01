@@ -7,6 +7,7 @@ use crate::solve::{self, Observation};
 use crate::track::TrackFilter;
 use mb_core::{Ecef, Geodetic, Icao, C_MPS};
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -28,7 +29,16 @@ pub struct ReceiverInfo {
     /// Expected timing error fed to the weighted solve, seconds (1σ).
     /// Covers clock jitter plus pair-model slack; per clock type.
     pub jitter_s: f64,
+    /// When the connection last read anything from its feeder (scaled
+    /// output clock, f64 bits), heartbeats included. Written by the
+    /// connection, read when another connection claims the same user.
+    pub last_read: Arc<AtomicU64>,
 }
+
+/// A connection that has read from its feeder this recently is live; a
+/// same-user connection is refused rather than let in over it. Real
+/// clients send at least a heartbeat every 30 s: two missed, plus slack.
+const CONNECTION_LIVE_S: f64 = 65.0;
 
 /// A receiver slot plus the generation it was issued with. Slot indexes
 /// are reused across reconnects; the generation tells stale holders apart.
@@ -320,11 +330,23 @@ impl State {
         self.t0_unix + self.t0_real.elapsed().as_secs_f64() * self.time_scale
     }
 
-    pub fn add_receiver(&mut self, info: ReceiverInfo) -> RxRef {
-        // A reconnect of the same user replaces the old slot: real feeders
-        // leave half-open sockets behind, and the old connection's late
-        // messages die on the generation check.
+    /// A new receiver's slot; None when the user is already connected and
+    /// that connection is live.
+    pub fn add_receiver(&mut self, info: ReceiverInfo) -> Option<RxRef> {
+        // A reconnect of the same user replaces the old slot when the old
+        // connection has gone quiet: real feeders leave half-open sockets
+        // behind, and the old connection's late messages die on the
+        // generation check. A live one is a second feeder under the same
+        // name, and it keeps its slot, as mlat-server keeps it ("User is
+        // already connected"). Replacing it made the two take turns: each
+        // replaced connection is closed (0.4.7), its feeder reconnects and
+        // replaces the other, and every swap threw away that receiver's
+        // clock sync.
         if let Some(&old) = self.by_user.get(&info.user) {
+            let heard = f64::from_bits(self.receivers[old].last_read.load(Ordering::Relaxed));
+            if self.alive[old] && self.scaled_now() - heard < CONNECTION_LIVE_S * self.time_scale {
+                return None;
+            }
             self.remove_receiver(RxRef {
                 idx: old,
                 gen: self.gens[old],
@@ -362,10 +384,10 @@ impl State {
             Some(r) if gps && !self.receivers[r].gps => self.reference = Some(idx),
             _ => {}
         }
-        RxRef {
+        Some(RxRef {
             idx,
             gen: self.gens[idx],
-        }
+        })
     }
 
     pub fn remove_receiver(&mut self, r: RxRef) {
@@ -1497,6 +1519,14 @@ fn dist(a: &Ecef, b: &Ecef) -> f64 {
 
 #[cfg(test)]
 mod tests {
+    impl State {
+        /// add_receiver for a name nobody holds live (rx_info's
+        /// connections have never read, so they never are).
+        fn add(&mut self, info: ReceiverInfo) -> RxRef {
+            self.add_receiver(info).expect("a free name")
+        }
+    }
+
     use super::*;
 
     fn rx_info(user: &str) -> ReceiverInfo {
@@ -1518,6 +1548,7 @@ mod tests {
             freq_hz: 12e6,
             gps: false,
             jitter_s: 150e-9,
+            last_read: Arc::new(AtomicU64::new(f64::NEG_INFINITY.to_bits())),
         }
     }
 
@@ -1528,12 +1559,12 @@ mod tests {
     #[test]
     fn slots_are_reused_after_removal() {
         let mut s = state();
-        let a = s.add_receiver(rx_info("a"));
-        let b = s.add_receiver(rx_info("b"));
+        let a = s.add(rx_info("a"));
+        let b = s.add(rx_info("b"));
         assert_eq!((a.idx, b.idx), (0, 1));
         s.remove_receiver(a);
         assert_eq!(s.live_receivers(), 1);
-        let c = s.add_receiver(rx_info("c"));
+        let c = s.add(rx_info("c"));
         assert_eq!(c.idx, a.idx, "freed slot is reused");
         assert_ne!(c.gen, a.gen, "reuse bumps the generation");
         assert_eq!(s.receivers.len(), 2, "no growth on reconnect churn");
@@ -1542,8 +1573,8 @@ mod tests {
     #[test]
     fn same_user_reconnect_replaces_the_old_slot() {
         let mut s = state();
-        let a = s.add_receiver(rx_info("stn"));
-        let b = s.add_receiver(rx_info("stn"));
+        let a = s.add(rx_info("stn"));
+        let b = s.add(rx_info("stn"));
         assert_eq!(s.live_receivers(), 1);
         assert_eq!(b.idx, a.idx, "same user takes the same slot back");
         assert_ne!(b.gen, a.gen);
@@ -1555,9 +1586,9 @@ mod tests {
     #[test]
     fn stale_generation_messages_are_ignored() {
         let mut s = state();
-        let a = s.add_receiver(rx_info("a"));
+        let a = s.add(rx_info("a"));
         s.remove_receiver(a);
-        let b = s.add_receiver(rx_info("b"));
+        let b = s.add(rx_info("b"));
         assert_eq!(b.idx, a.idx);
         s.clock_reset(a); // stale; must not touch b's pairs
         s.on_mlat(a, 1000.0, "20000f1f10ce93", 0.0);
@@ -1575,8 +1606,8 @@ mod tests {
         let mut a_info = rx_info("alice");
         a_info.uid = 7;
         a_info.uuid = Some("u-a".into());
-        let a = s.add_receiver(a_info);
-        let _b = s.add_receiver(rx_info("bob"));
+        let a = s.add(a_info);
+        let _b = s.add(rx_info("bob"));
         // A DF11 all-call from 3c6444, heard by alice only.
         s.on_mlat(a, 1000.0, "5d3c6444aabbcc", s.scaled_now());
         let (clients, aircraft) = s.state_json();
@@ -1606,7 +1637,7 @@ mod tests {
     #[test]
     fn expiry_empties_every_per_aircraft_map() {
         let mut s = state();
-        let rx = s.add_receiver(rx_info("a"));
+        let rx = s.add(rx_info("a"));
         let now = s.scaled_now();
         s.on_mlat(rx, 1000.0, "5d3c6444aabbcc", now);
         let icao = *s.ac_log.keys().next().expect("logged");
@@ -1652,7 +1683,7 @@ mod tests {
                 };
                 info.ecef = info.geo.to_ecef();
             }
-            refs.push(s.add_receiver(info));
+            refs.push(s.add(info));
         }
         // a..d hear one DF11; "far" hears nothing; "atlanta" hears another
         // aircraft that sent the same frame (a collision across the ocean).
@@ -1683,10 +1714,10 @@ mod tests {
     #[test]
     fn sync_json_carries_bad_syncs_and_fudged_position() {
         let mut s = state();
-        s.add_receiver(rx_info("alice"));
+        s.add(rx_info("alice"));
         let mut p = rx_info("private");
         p.privacy = true;
-        s.add_receiver(p);
+        s.add(p);
         let j = s.sync_json();
         assert_eq!(j["alice"]["bad_syncs"], 0.0);
         let lat = j["alice"]["lat"].as_f64().unwrap();
@@ -1874,7 +1905,7 @@ mod tests {
                 alt_m: 300.0,
             };
             info.ecef = info.geo.to_ecef();
-            ids.push(st.add_receiver(info).idx);
+            ids.push(st.add(info).idx);
         }
         let icao = Icao(0x33FFDB);
         st.alts_ft.insert(icao, 15_000);
@@ -1970,7 +2001,7 @@ mod tests {
                 alt_m: 40.0,
             };
             info.ecef = info.geo.to_ecef();
-            let r = st.add_receiver(info);
+            let r = st.add(info);
             let t = 100.0 + dist(&truth.to_ecef(), &st.receivers[r.idx].ecef) / mb_core::C_MPS;
             cluster.push((r.idx, t, 100e-9, st.scaled_now()));
         }
@@ -2083,10 +2114,37 @@ mod tests {
     }
 
     #[test]
+    fn a_second_feeder_under_a_live_name_is_refused() {
+        let mut s = state();
+        let first = rx_info("shared");
+        // Its connection read a heartbeat just now.
+        first
+            .last_read
+            .store(s.scaled_now().to_bits(), Ordering::Relaxed);
+        let a = s.add(first);
+        assert!(s.add_receiver(rx_info("shared")).is_none());
+        assert!(s.live(a), "the first keeps its slot");
+    }
+
+    #[test]
+    fn a_reconnect_over_a_quiet_connection_takes_the_slot() {
+        let mut s = state();
+        let old = rx_info("feeder");
+        // Last heard 70 s ago: a link that died without closing.
+        old.last_read
+            .store((s.scaled_now() - 70.0).to_bits(), Ordering::Relaxed);
+        let a = s.add(old);
+        let b = s
+            .add_receiver(rx_info("feeder"))
+            .expect("replaces the quiet one");
+        assert!(!s.live(a) && s.live(b));
+    }
+
+    #[test]
     fn a_reconnect_forgets_the_old_clocks_pending_times() {
         let mut s = state();
-        let a = s.add_receiver(rx_info("a"));
-        let b = s.add_receiver(rx_info("b"));
+        let a = s.add(rx_info("a"));
+        let b = s.add(rx_info("b"));
         s.syncpoints.insert(
             ("e".into(), "o".into()),
             SyncPoint {
@@ -2094,7 +2152,7 @@ mod tests {
                 reporters: vec![(a.idx, 1.0, 1.1), (b.idx, 2.0, 2.1)],
             },
         );
-        let b2 = s.add_receiver(rx_info("b"));
+        let b2 = s.add(rx_info("b"));
         assert_eq!(b2.idx, b.idx, "same slot, new clock");
         let sp = &s.syncpoints[&("e".to_string(), "o".to_string())];
         assert_eq!(sp.reporters, vec![(a.idx, 1.0, 1.1)]);
