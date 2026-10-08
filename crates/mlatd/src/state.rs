@@ -36,9 +36,13 @@ pub struct ReceiverInfo {
 }
 
 /// A connection that has read from its feeder this recently is live; a
-/// same-user connection is refused rather than let in over it. Real
-/// clients send at least a heartbeat every 30 s: two missed, plus slack.
-const CONNECTION_LIVE_S: f64 = 65.0;
+/// same-user connection without a telling uuid is refused rather than let
+/// in over it. mlat-client sends a heartbeat every 120 s when it has
+/// nothing else to say (jsonclient.py, heartbeat_interval); one missed,
+/// plus slack. mlat-server itself closes a connection quiet for 150 s.
+/// 0.4.8 took the heartbeat for 30 s and judged a quiet, live feeder dead
+/// after 65 s: a same-name twin reconnecting then replaced it.
+const CONNECTION_LIVE_S: f64 = 150.0;
 
 /// A receiver slot plus the generation it was issued with. Slot indexes
 /// are reused across reconnects; the generation tells stale holders apart.
@@ -330,27 +334,72 @@ impl State {
         self.t0_unix + self.t0_real.elapsed().as_secs_f64() * self.time_scale
     }
 
-    /// A new receiver's slot; None when the user is already connected and
-    /// that connection is live.
-    pub fn add_receiver(&mut self, info: ReceiverInfo) -> Option<RxRef> {
-        // A reconnect of the same user replaces the old slot when the old
-        // connection has gone quiet: real feeders leave half-open sockets
-        // behind, and the old connection's late messages die on the
-        // generation check. A live one is a second feeder under the same
-        // name, and it keeps its slot, as mlat-server keeps it ("User is
-        // already connected"). Replacing it made the two take turns: each
-        // replaced connection is closed (0.4.7), its feeder reconnects and
-        // replaces the other, and every swap threw away that receiver's
-        // clock sync.
+    /// A new receiver's slot; None when the user is already connected,
+    /// that connection is live, and nothing tells the two apart.
+    pub fn add_receiver(&mut self, mut info: ReceiverInfo) -> Option<RxRef> {
+        // A reconnect of the same user replaces the old slot. Who counts as
+        // the same feeder: the handshake uuid when both carry one (the
+        // same feeder's reconnect replaces at once, over a dead link or a
+        // live one; a different uuid is a second feeder and is let in
+        // under a name of its own, below). Without that, a quiet old
+        // connection is a link that died without closing (real feeders
+        // leave half-open sockets behind; the old connection's late
+        // messages die on the generation check) and is replaced; a live
+        // one is a second feeder under the same name and keeps its slot,
+        // as mlat-server keeps it ("User is already connected"). Replacing
+        // it made the two take turns: each replaced connection is closed
+        // (0.4.7), its feeder reconnects and replaces the other, and every
+        // swap threw away that receiver's clock sync.
+        //
+        // Default station names ("Home") collide across a network of
+        // hundreds of feeders, and mlat-server's answer loses the second
+        // feeder for good. A newcomer whose uuid differs from the live
+        // holder's takes the name suffixed with its uuid's head, stable
+        // across its own reconnects, so the operator sees the pair in
+        // clients.json and both receivers keep their sync.
         if let Some(&old) = self.by_user.get(&info.user) {
+            let same_feeder = matches!(
+                (&self.receivers[old].uuid, &info.uuid),
+                (Some(a), Some(b)) if a == b
+            );
             let heard = f64::from_bits(self.receivers[old].last_read.load(Ordering::Relaxed));
-            if self.alive[old] && self.scaled_now() - heard < CONNECTION_LIVE_S * self.time_scale {
-                return None;
+            let live =
+                self.alive[old] && self.scaled_now() - heard < CONNECTION_LIVE_S * self.time_scale;
+            if !same_feeder && live {
+                let uuid = info.uuid.as_deref().filter(|u| !u.is_empty())?;
+                let tag: String = uuid
+                    .chars()
+                    .filter(|c| c.is_ascii_alphanumeric())
+                    .take(8)
+                    .collect();
+                if tag.is_empty() {
+                    return None;
+                }
+                let alias = format!("{}-{}", info.user, tag);
+                // The alias may itself be held: by this feeder's own
+                // previous connection (same uuid, replaced) or, with a
+                // forged uuid head, by a live stranger (refused).
+                if let Some(&held) = self.by_user.get(&alias) {
+                    let twin = self.receivers[held].uuid.as_deref() == Some(uuid);
+                    let heard =
+                        f64::from_bits(self.receivers[held].last_read.load(Ordering::Relaxed));
+                    let held_live = self.alive[held]
+                        && self.scaled_now() - heard < CONNECTION_LIVE_S * self.time_scale;
+                    if !twin && held_live {
+                        return None;
+                    }
+                    self.remove_receiver(RxRef {
+                        idx: held,
+                        gen: self.gens[held],
+                    });
+                }
+                info.user = alias;
+            } else {
+                self.remove_receiver(RxRef {
+                    idx: old,
+                    gen: self.gens[old],
+                });
             }
-            self.remove_receiver(RxRef {
-                idx: old,
-                gen: self.gens[old],
-            });
         }
         let gps = info.gps;
         let user = info.user.clone();
@@ -2130,14 +2179,75 @@ mod tests {
     fn a_reconnect_over_a_quiet_connection_takes_the_slot() {
         let mut s = state();
         let old = rx_info("feeder");
-        // Last heard 70 s ago: a link that died without closing.
+        // Last heard 160 s ago: a link that died without closing.
         old.last_read
-            .store((s.scaled_now() - 70.0).to_bits(), Ordering::Relaxed);
+            .store((s.scaled_now() - 160.0).to_bits(), Ordering::Relaxed);
         let a = s.add(old);
         let b = s
             .add_receiver(rx_info("feeder"))
             .expect("replaces the quiet one");
         assert!(!s.live(a) && s.live(b));
+    }
+
+    #[test]
+    fn a_feeder_between_heartbeats_is_still_live() {
+        // mlat-client heartbeats every 120 s when there is no traffic; a
+        // quiet night feeder heard 100 s ago is live, and a same-name
+        // stranger does not take its slot (0.4.8 judged it dead at 65 s).
+        let mut s = state();
+        let first = rx_info("Home");
+        first
+            .last_read
+            .store((s.scaled_now() - 100.0).to_bits(), Ordering::Relaxed);
+        let a = s.add(first);
+        assert!(s.add_receiver(rx_info("Home")).is_none());
+        assert!(s.live(a));
+    }
+
+    #[test]
+    fn the_same_uuid_reconnecting_replaces_a_live_connection_at_once() {
+        let mut s = state();
+        let mut old = rx_info("feeder");
+        old.uuid = Some("aaaa-1111".into());
+        old.last_read
+            .store(s.scaled_now().to_bits(), Ordering::Relaxed);
+        let a = s.add(old);
+        let mut again = rx_info("feeder");
+        again.uuid = Some("aaaa-1111".into());
+        let b = s
+            .add_receiver(again)
+            .expect("the same feeder, no 90 s wait");
+        assert!(!s.live(a) && s.live(b));
+        assert_eq!(s.receivers[b.idx].user, "feeder", "keeps its name");
+    }
+
+    #[test]
+    fn a_second_feeder_with_its_own_uuid_is_admitted_under_an_alias() {
+        let mut s = state();
+        let mut first = rx_info("Home");
+        first.uuid = Some("aaaa-1111-zzzz".into());
+        first
+            .last_read
+            .store(s.scaled_now().to_bits(), Ordering::Relaxed);
+        let a = s.add(first);
+        let mut other = rx_info("Home");
+        other.uuid = Some("bbbb-2222-yyyy".into());
+        let b = s.add_receiver(other).expect("a different feeder is let in");
+        assert!(s.live(a) && s.live(b));
+        assert_eq!(s.receivers[a.idx].user, "Home");
+        assert_eq!(s.receivers[b.idx].user, "Home-bbbb2222");
+        assert_eq!(s.by_user.len(), 2);
+        // Its own reconnect lands on its alias, and the first never drops.
+        s.receivers[b.idx]
+            .last_read
+            .store(s.scaled_now().to_bits(), Ordering::Relaxed);
+        let mut again = rx_info("Home");
+        again.uuid = Some("bbbb-2222-yyyy".into());
+        let b2 = s.add_receiver(again).expect("its alias is its own");
+        assert!(s.live(a) && !s.live(b) && s.live(b2));
+        assert_eq!(s.receivers[b2.idx].user, "Home-bbbb2222");
+        // A stranger without a uuid is still refused.
+        assert!(s.add_receiver(rx_info("Home")).is_none());
     }
 
     #[test]

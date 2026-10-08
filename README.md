@@ -53,6 +53,14 @@ Add this line to the feeder configuration (readsb or ultrafeeder):
 mlat,<host>,31090,uuid=<station-uuid>
 ```
 
+The uuid is what tells one feeder from another. Two feeders that share a
+user name (the install defaults collide: "Home") are both served when they
+carry their own uuid; the second appears as `<name>-<uuid head>`. A
+feeder's reconnect replaces its previous connection at once. Without a
+uuid, a second connection under a live name is refused, as mlat-server
+refuses it, and told to retry in 160 s; a connection quiet for 150 s is
+replaced.
+
 Results reach readsb either way: readsb pulls from the SBS port
 (`--net-connector=<mlatd-host>,31003,sbs_in_mlat`, which tags the
 positions as MLAT), or mlatd pushes to readsb with

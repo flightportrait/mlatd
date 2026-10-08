@@ -612,13 +612,14 @@ async fn handle_client(
         Ok(Some(rx)) => rx,
         Ok(None) => {
             // mlat-server's answer to a second connection of a connected
-            // user. The retry comes after the live window has run out, so
-            // a reconnect over a dead link gets in on it.
+            // user: a same-name feeder with no uuid to tell it apart. The
+            // retry comes after the live window (150 s) has run out, so a
+            // reconnect over a dead link gets in on it.
             release(&shard, None).await;
             let _ = wr
                 .write_all(
                     format!(
-                        "{{\"deny\":[\"User {} is already connected\"],\"reconnect_in\":90}}\n",
+                        "{{\"deny\":[\"User {} is already connected\"],\"reconnect_in\":160}}\n",
                         user.replace(['"', '\\'], "")
                     )
                     .as_bytes(),
