@@ -53,7 +53,7 @@ pub const MAX_RMS_S: f64 = 3e-6;
 /// timestamp clustering. The bench showed the failure this cures: 300 m
 /// error bursts caused by one receiver's sync noise in the solve.
 pub fn solve_robust(obs: &[Observation], alt_m: f64, init: Geodetic) -> Option<Solution> {
-    let full = solve(obs, alt_m, init);
+    let full = solve(obs, alt_m, init).and_then(|s| across_the_line(obs, alt_m, s));
     // LOO only when the full set actually failed or fit badly. The bench
     // rejected unconditional LOO (lab p90 38→73 m): an n−1 subset fits
     // 3 parameters to 4 points, so its rms is structurally small, and an
@@ -80,6 +80,100 @@ pub fn solve_robust(obs: &[Observation], alt_m: f64, init: Geodetic) -> Option<S
         }
     }
     best
+}
+
+/// A fit's own residual, taken as a factor of the one the stated timing
+/// errors predict, above which a solve over five or more receivers is tried
+/// again from the far side of the receivers: the lobe test below. A
+/// 4-receiver solve is always tried: with one spare equation it fits the
+/// wrong lobe to the noise floor when the receivers are collinear enough.
+const LOBE_TEST_RMS_FACTOR: f64 = 3.0;
+/// Two lobes whose residuals are within this factor of each other cannot be
+/// told apart by the timing; the fix is refused.
+const LOBE_AMBIGUOUS_FACTOR: f64 = 3.0;
+
+/// The mirror lobe. Receivers strung along a valley, a coast or a motorway
+/// are near-collinear, and with altitude fixed a TDOA fit then has two
+/// solutions, one each side of the line, that differ only through the
+/// receivers' scatter off it. Gauss-Newton converges into whichever lobe
+/// its start lies in: a cold start on the receivers' centroid picks at
+/// random, and a warm start keeps the track in the lobe the first fix chose
+/// (valley scenario: a helicopter 6 km east of four receivers was tracked
+/// 12 km away on the west side for the whole run, every fix a 4-receiver
+/// solve the track itself gated in). The wrong lobe fits worse by the
+/// scatter the receivers do have; a fit whose residual is well above what
+/// its timing errors predict is re-solved from the point mirrored across
+/// the receivers' principal axis, and the better fit kept. Two lobes that
+/// fit alike are an ambiguity the timing cannot resolve: no fix.
+fn across_the_line(obs: &[Observation], alt_m: f64, sol: Solution) -> Option<Solution> {
+    let expected_rms =
+        (obs.iter().map(|o| o.err_s * o.err_s).sum::<f64>() / obs.len() as f64).sqrt();
+    if obs.len() > 4 && sol.rms_s <= LOBE_TEST_RMS_FACTOR * expected_rms {
+        return Some(sol);
+    }
+    let mirror = mirror_across_receivers(obs, &sol.pos)?;
+    let Some(other) = solve(obs, alt_m, mirror) else {
+        return Some(sol);
+    };
+    // The re-solve may just come back to the same lobe.
+    if other.pos.haversine_m(&sol.pos) < 3.0 * sol.err_geom_m.max(other.err_geom_m).max(100.0) {
+        return Some(sol);
+    }
+    let (good, bad) = if other.rms_s < sol.rms_s {
+        (other, sol)
+    } else {
+        (sol, other)
+    };
+    if bad.rms_s < LOBE_AMBIGUOUS_FACTOR * good.rms_s {
+        return None;
+    }
+    Some(good)
+}
+
+/// `p` reflected across the receivers' principal axis (the line through
+/// their centroid along their largest spread), in ECEF; None when the
+/// receivers have no spread.
+fn mirror_across_receivers(obs: &[Observation], p: &Geodetic) -> Option<Geodetic> {
+    let n = obs.len() as f64;
+    let c = obs.iter().fold([0.0; 3], |a, o| {
+        [a[0] + o.rx.x / n, a[1] + o.rx.y / n, a[2] + o.rx.z / n]
+    });
+    // Principal axis by a few power iterations on the 3×3 scatter matrix.
+    let mut m = [[0.0f64; 3]; 3];
+    for o in obs {
+        let d = [o.rx.x - c[0], o.rx.y - c[1], o.rx.z - c[2]];
+        for (i, di) in d.iter().enumerate() {
+            for (j, dj) in d.iter().enumerate() {
+                m[i][j] += di * dj;
+            }
+        }
+    }
+    let mut u = [1.0f64, 1.0, 1.0];
+    for _ in 0..50 {
+        let v = [
+            m[0][0] * u[0] + m[0][1] * u[1] + m[0][2] * u[2],
+            m[1][0] * u[0] + m[1][1] * u[1] + m[1][2] * u[2],
+            m[2][0] * u[0] + m[2][1] * u[1] + m[2][2] * u[2],
+        ];
+        let norm = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+        if norm < 1.0 {
+            return None;
+        }
+        u = [v[0] / norm, v[1] / norm, v[2] / norm];
+    }
+    let pe = p.to_ecef();
+    let d = [pe.x - c[0], pe.y - c[1], pe.z - c[2]];
+    let along = d[0] * u[0] + d[1] * u[1] + d[2] * u[2];
+    let mirrored = Ecef {
+        x: c[0] + 2.0 * along * u[0] - d[0],
+        y: c[1] + 2.0 * along * u[1] - d[1],
+        z: c[2] + 2.0 * along * u[2] - d[2],
+    }
+    .to_geodetic();
+    Some(Geodetic {
+        alt_m: p.alt_m,
+        ..mirrored
+    })
 }
 
 pub fn solve(obs: &[Observation], alt_m: f64, init: Geodetic) -> Option<Solution> {
@@ -318,6 +412,106 @@ mod tests {
         let err = s.pos.haversine_m(&truth);
         assert!(err < 1.0, "err {err} m after {} iters", s.iterations);
         assert!(s.rms_s < 1e-9);
+    }
+
+    /// Four receivers along a valley, a few hundred metres off a line, and
+    /// a helicopter 6 km to one side. Observations from the truth, with
+    /// 50 ns noise.
+    fn valley(truth: &Geodetic, scatter_deg: f64) -> Vec<Observation> {
+        let te = truth.to_ecef();
+        let rxs = [
+            (47.000, -1.500 - scatter_deg, 60.0),
+            (47.063, -1.500 + 1.6 * scatter_deg, 90.0),
+            (47.127, -1.500 - 1.6 * scatter_deg, 75.0),
+            (47.190, -1.500 + 0.6 * scatter_deg, 110.0),
+        ];
+        let t_tx = 10.0;
+        let mut seed = 7u64;
+        rxs.iter()
+            .map(|&(la, lo, al)| {
+                let r = Geodetic {
+                    lat_deg: la,
+                    lon_deg: lo,
+                    alt_m: al,
+                }
+                .to_ecef();
+                let d = ((te.x - r.x).powi(2) + (te.y - r.y).powi(2) + (te.z - r.z).powi(2)).sqrt();
+                seed = seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let noise = ((seed >> 11) as f64 / (1u64 << 53) as f64 - 0.5) * 100e-9;
+                Observation {
+                    rx: r,
+                    t_s: t_tx + d / C_MPS + noise,
+                    err_s: 50e-9,
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_warm_start_in_the_wrong_lobe_comes_back_across_the_line() {
+        let truth = Geodetic {
+            lat_deg: 47.095,
+            lon_deg: -1.420,
+            alt_m: 457.0,
+        };
+        let obs = valley(&truth, 0.005);
+        // The track sits in the mirror lobe, 6 km west of the line.
+        let wrong = Geodetic {
+            lon_deg: -1.580,
+            ..truth
+        };
+        let alone = solve(&obs, truth.alt_m, wrong).expect("the wrong lobe fits under 3 µs");
+        assert!(
+            alone.pos.haversine_m(&truth) > 5_000.0,
+            "plain solve stays in its lobe"
+        );
+        let s = solve_robust(&obs, truth.alt_m, wrong).expect("a fix");
+        let err = s.pos.haversine_m(&truth);
+        assert!(err < 150.0, "err {err} m");
+    }
+
+    #[test]
+    fn a_cold_start_on_the_line_lands_in_the_right_lobe() {
+        let truth = Geodetic {
+            lat_deg: 47.095,
+            lon_deg: -1.420,
+            alt_m: 457.0,
+        };
+        let obs = valley(&truth, 0.005);
+        let centroid = Geodetic {
+            lat_deg: 47.095,
+            lon_deg: -1.500,
+            alt_m: 457.0,
+        };
+        let s = solve_robust(&obs, truth.alt_m, centroid).expect("a fix");
+        let err = s.pos.haversine_m(&truth);
+        assert!(err < 150.0, "err {err} m");
+    }
+
+    #[test]
+    fn receivers_on_one_line_give_no_fix() {
+        let truth = Geodetic {
+            lat_deg: 47.095,
+            lon_deg: -1.420,
+            alt_m: 457.0,
+        };
+        let obs = valley(&truth, 0.0);
+        let wrong = Geodetic {
+            lon_deg: -1.580,
+            ..truth
+        };
+        let s = solve(&obs, truth.alt_m, wrong).expect("fits");
+        assert!(
+            s.pos.haversine_m(&truth) > 10_000.0 && s.rms_s < 10e-9,
+            "the wrong lobe fits to the noise floor: rms {}",
+            s.rms_s
+        );
+        assert!(
+            solve_robust(&obs, truth.alt_m, wrong).is_none(),
+            "both lobes fit alike"
+        );
     }
 
     /// With 100 ns timing noise the solve should land within ~100 m and
